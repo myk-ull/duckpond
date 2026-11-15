@@ -110,6 +110,10 @@ struct App {
     last_items: Vec<Item>,
     next_prefs_check: Instant,
     known: HashSet<String>,
+    /// a duck to point out as soon as it hatches (a duplicate, a new folder)
+    spot_next: Option<String>,
+    /// where the desktop menu was last opened: things it creates land there
+    menu_point: Option<((f32, f32), Instant)>,
     next_clock: Instant,
     started: Instant,
     snap_stage: u8,
@@ -196,6 +200,8 @@ impl App {
             last_items: vec![],
             next_prefs_check: now,
             known: HashSet::new(),
+            spot_next: None,
+            menu_point: None,
             next_clock: now,
             started: now,
             snap_stage: 0,
@@ -340,13 +346,31 @@ impl App {
         let mut rng = scene::Rng::new(items.len() as u64 + 3);
         let mut dirty = !removed.is_empty();
         for it in added {
-            let phys = it
-                .pos
-                .or_else(|| self.settings.state.homes.get(&it.key).copied());
+            let fresh_menu = self
+                .menu_point
+                .filter(|(_, t)| t.elapsed() < Duration::from_secs(20))
+                .map(|(p, _)| p);
+            // a duplicate already has its spot beside the original, and things
+            // made from the desktop menu land where it was opened; otherwise
+            // the native icon position (Windows) or the remembered home
+            let stored = self.settings.state.homes.get(&it.key).copied();
+            let phys = if self.spot_next.as_deref() == Some(it.key.as_str()) {
+                stored.or(it.pos)
+            } else if fresh_menu.is_some() && !entrance && stored.is_none() {
+                None
+            } else {
+                it.pos.or(stored)
+            };
+            if phys.is_none() && fresh_menu.is_some() && !entrance && self.spot_next.is_none() {
+                self.spot_next = Some(it.key.clone());
+            }
             let home = match phys {
                 Some((x, y)) => ((x / f) as f32, (y / f) as f32),
                 None => {
-                    let s = scene.free_slot();
+                    let s = match fresh_menu {
+                        Some((x, y)) if !entrance => scene.free_near(x, y),
+                        _ => scene.free_slot(),
+                    };
                     self.settings
                         .state
                         .homes
@@ -378,6 +402,13 @@ impl App {
             );
         }
         self.known = now_keys;
+        if let Some(k) = self.spot_next.clone() {
+            if scene.find(&k).is_some() {
+                scene.spotlight(&k);
+                self.spot_next = None;
+                self.menu_point = None;
+            }
+        }
         // the ducklings rule depends on the whole flock: re-apply on any change
         if !removed.is_empty() || had_new {
             let adults = self.settings.adult_keys(&items);
@@ -426,7 +457,59 @@ impl App {
             Outcome::ToggleLabels => self.toggle_labels(),
             Outcome::OpenPrefs => self.open_preferences(None),
             Outcome::Customise(key) => self.open_preferences(Some(key)),
+            Outcome::Renamed { old, new } => self.renamed(old, new),
+            Outcome::Duplicated { src, new } => self.duplicated(src, new),
         }
+    }
+
+    /// Same duck, new name: keep its spot, look and per-file settings.
+    fn renamed(&mut self, old: String, new: String) {
+        let path = std::path::Path::new(&new);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| new.clone());
+        let is_link = std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let is_dir = path.is_dir();
+        let kind = items::kind_for(&name, is_dir, is_link);
+        if let Some(h) = self.settings.state.homes.remove(&old) {
+            self.settings.state.homes.insert(new.clone(), h);
+        }
+        self.settings.save_state();
+        if let Some(fp) = self.settings.prefs.files.remove(&old) {
+            self.settings.prefs.files.insert(new.clone(), fp);
+            self.settings.save_prefs();
+        }
+        self.known.remove(&old);
+        self.known.insert(new.clone());
+        if let Some(s) = &mut self.scene {
+            s.rename_duck(&old, &new, &name, kind);
+            catalog::write_items(&s.ducks);
+        }
+        self.next_scan = Instant::now() + Duration::from_millis(400);
+    }
+
+    /// The copy's duck lands right beside the original, looking just like it.
+    fn duplicated(&mut self, src: String, new: String) {
+        let f = self.factor as f64;
+        if let Some(s) = &self.scene {
+            if let Some(i) = s.find(&src) {
+                let d = &s.ducks[i];
+                let (x, y) = s.free_near(d.home.0 + 16.0, d.home.1 + 2.0);
+                self.settings
+                    .state
+                    .homes
+                    .insert(new.clone(), (x as f64 * f, y as f64 * f));
+            }
+        }
+        if let Some(fp) = self.settings.prefs.files.get(&src).cloned() {
+            self.settings.prefs.files.insert(new.clone(), fp);
+            self.settings.save_prefs();
+        }
+        self.spot_next = Some(new);
+        self.next_scan = Instant::now();
     }
 
     /// Open the native Preferences window (a small SwiftUI app next to the
@@ -1021,6 +1104,7 @@ impl App {
                     }
                     None => {
                         let labels = scene.show_labels;
+                        self.menu_point = Some((at, Instant::now()));
                         self.plat.show_desktop_menu(&window, labels)
                     }
                 };
@@ -1059,6 +1143,11 @@ impl App {
             }
             Key::Character(c) if cmd && c.as_str().eq_ignore_ascii_case("o") => {
                 self.plat.open(&sel)
+            }
+            // Finder's ⌘D
+            #[cfg(target_os = "macos")]
+            Key::Character(c) if cmd && c.as_str().eq_ignore_ascii_case("d") => {
+                self.plat.duplicate(&sel)
             }
             _ => {}
         }
@@ -1418,6 +1507,9 @@ impl App {
             }
         }
         self.handle_tray(el);
+        for o in self.plat.poll() {
+            self.apply(o);
+        }
         let now = Instant::now();
         if let Some(out) = snapshot_path() {
             self.snapshot_step(el, &out);

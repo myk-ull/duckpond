@@ -107,7 +107,13 @@ pub struct Duck {
     next_blink: f32,
     pace: f32,
     hatch: f32,
-    was_land: bool,
+    /// standing on a lily pad / the bank (true) or swimming. Changes only
+    /// through a crossing: pause at the edge, hop, then shake off or splash.
+    land: bool,
+    /// seconds left looking at the edge before hopping across
+    cross: f32,
+    /// the hop itself: from, to, and whether it lands on land
+    jump: Option<((f32, f32), (f32, f32), bool)>,
     voice: u8,
     vx: f32,
     vy: f32,
@@ -135,6 +141,14 @@ pub struct Duck {
     shake: f32,
     /// seconds left on a speech bubble ("quack, I'm just visiting!")
     say: f32,
+    /// where a crossing will hop to once the pause at the edge is over
+    hop_to: Option<((f32, f32), bool)>,
+}
+
+fn land_at(land: &[bool], w: u32, h: u32, x: f32, y: f32) -> bool {
+    let xi = (x.max(0.0) as u32).min(w - 1);
+    let yi = (y.max(0.0) as u32).min(h - 1);
+    land[(yi * w + xi) as usize]
 }
 
 struct Crumb {
@@ -206,6 +220,8 @@ pub struct Scene {
     t: f32,
     pub hover: Option<usize>,
     pub selected: Option<usize>,
+    /// a duck to point out for a few seconds (just renamed / duplicated)
+    spot: Option<(String, f32)>,
     pub show_labels: bool,
     pub show_hats: bool,
     /// hover/selected tags are drawn by the hi-res overlay instead
@@ -237,6 +253,12 @@ struct Dragonfly {
 /// Each painting pixel covers BG_SCALE x BG_SCALE art pixels (chunkier Monet).
 pub const BG_SCALE: u32 = 2;
 /// Keep duck heads clear of the menu bar / top edge (art px).
+/// The hop between water and a lily pad, and the widest gap hopped in one go.
+const HOP: f32 = 0.38;
+const GAP: f32 = 8.0;
+/// Seconds of pecking per bite, and of happy munching after it.
+const EAT_BITE: f32 = 1.0;
+const MUNCH: f32 = 0.4;
 const TOP_MARGIN: f32 = 14.0;
 /// Keep ducks this far from the left/right/bottom edges (art px).
 const EDGE_MARGIN: f32 = 16.0;
@@ -268,6 +290,7 @@ impl Scene {
             rng: Rng::new(0x9e3779b97f4a7c15 ^ (w as u64 * 31 + h as u64)),
             t: 0.0,
             hover: None,
+            spot: None,
             selected: None,
             show_labels: false,
             show_hats: false,
@@ -373,7 +396,10 @@ impl Scene {
                 self.rng.range(0.7, 1.1)
             },
             hatch: -entrance_delay,
-            was_land: true,
+            land: true,
+            cross: 0.0,
+            jump: None,
+            hop_to: None,
             voice,
             vx: 0.0,
             vy: 0.0,
@@ -393,8 +419,8 @@ impl Scene {
             shake: 0.0,
             say: 0.0,
         };
-        let was_land = self.is_land(d.x, d.y);
-        self.ducks.push(Duck { was_land, ..d });
+        let land = self.is_land(d.x, d.y);
+        self.ducks.push(Duck { land, ..d });
         self.families_dirty = true;
     }
 
@@ -409,6 +435,51 @@ impl Scene {
                 s => s,
             };
         }
+    }
+
+    /// The file behind a duck was renamed: same duck, new name.
+    pub fn rename_duck(&mut self, old: &str, new: &str, name: &str, kind: Kind) -> bool {
+        let Some(i) = self.find(old) else {
+            return false;
+        };
+        let d = &mut self.ducks[i];
+        d.key = new.to_string();
+        d.name = name.to_string();
+        d.kind = kind;
+        self.spotlight(new);
+        true
+    }
+
+    /// Point a duck out for a few seconds: name tag, ring, a hop and a quack.
+    pub fn spotlight(&mut self, key: &str) {
+        self.spot = Some((key.to_string(), 3.5));
+        if let Some(i) = self.find(key) {
+            self.wake_and_quack(i);
+        }
+    }
+
+    fn spotted(&self) -> Option<usize> {
+        self.spot.as_ref().and_then(|(k, _)| self.find(k))
+    }
+
+    /// A free home near (x, y): beside a duck, or where the menu was opened.
+    pub fn free_near(&self, x: f32, y: f32) -> (f32, f32) {
+        for r in [0.0f32, 16.0, 24.0, 32.0, 44.0, 58.0] {
+            let n = if r == 0.0 { 1 } else { (r / 4.0) as i32 };
+            for k in 0..n {
+                // start on the right, then work round
+                let a = k as f32 / n as f32 * std::f32::consts::TAU;
+                let (cx, cy) = self.clamp(x + a.cos() * r, y + a.sin() * r * 0.6);
+                if self
+                    .ducks
+                    .iter()
+                    .all(|d| (d.home.0 - cx).hypot((d.home.1 - cy) * 1.4) > 15.0)
+                {
+                    return (cx, cy);
+                }
+            }
+        }
+        self.clamp(x, y)
     }
 
     pub fn find(&self, key: &str) -> Option<usize> {
@@ -812,8 +883,16 @@ impl Scene {
     /// Where duck i should stand for its place in the crumb's line.
     fn spot(&self, i: usize, cx: f32, cy: f32) -> (f32, f32) {
         let d = &self.ducks[i];
+        let water = !self.is_land(cx, cy);
+        let row = (d.breed * 2 + d.baby as usize).min(EAT_TIP.len() - 1);
+        let (tx, ty) = EAT_TIP[row][water as usize];
+        // the sprite is drawn with its bottom-centre on (x, y); offset it so
+        // the bill tip lands on the crumb's top pixel (cx, cy - 1)
+        let reach = (tx - CELL_W as i32 / 2) as f32 + if d.side > 0.0 { 1.0 } else { 0.0 };
+        if d.slot == 0 {
+            return (cx + d.side * reach, cy + (CELL_H as i32 - 2 - ty) as f32);
+        }
         let k = d.slot as f32;
-        let reach = if d.baby { 7.0 } else { 10.0 };
         self.clamp(cx + d.side * (reach + 16.0 * k), cy + 0.5 + k * 2.0)
     }
 
@@ -850,6 +929,12 @@ impl Scene {
 
     pub fn update(&mut self, dt: f32) {
         self.t += dt;
+        if let Some((_, t)) = &mut self.spot {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.spot = None;
+            }
+        }
 
         // pending crumbs → falling crumbs
         let mut i = 0;
@@ -1161,7 +1246,19 @@ impl Scene {
 
     fn update_duck(&mut self, i: usize, dt: f32) {
         let (x, y) = (self.ducks[i].x, self.ducks[i].y);
-        let on_land = self.is_land(x, y);
+        let here = self.is_land(x, y);
+        {
+            let d = &mut self.ducks[i];
+            if d.st == St::Held || d.hatch < 1.0 {
+                // carried or just hatched: it is wherever it is
+                d.land = here;
+                d.cross = 0.0;
+                d.jump = None;
+            }
+        }
+        self.update_crossing(i, dt);
+        let on_land = self.ducks[i].land;
+        let (x, y) = (self.ducks[i].x, self.ducks[i].y);
         {
             let d = &mut self.ducks[i];
             if d.hatch < 1.0 {
@@ -1185,39 +1282,15 @@ impl Scene {
                 d.blink = 0.14;
                 d.next_blink = 2.5 + (d.anim * 7.3).sin().abs() * 4.0;
             }
-            if d.was_land && !on_land {
-                self.ripples.push(Ripple {
-                    x,
-                    y,
-                    r: 1.5,
-                    life: 0.7,
-                });
+            if d.jump.is_none() {
+                d.hop = (d.hop - dt).max(0.0);
             }
-            let climbed_out = !d.was_land && on_land;
-            d.was_land = on_land;
-            d.hop = (d.hop - dt).max(0.0);
             d.say = (d.say - dt).max(0.0);
             d.shake = (d.shake - dt).max(0.0);
             d.think = (d.think - dt).max(0.0);
             d.next_think -= dt;
-            if climbed_out {
-                d.shake = 0.45;
-                let baby = d.baby;
-                for k in 0..4 {
-                    let a = k as f32 * 1.57 + 0.4;
-                    let hgt = if baby { 7.0 } else { 13.0 };
-                    self.particles.push(Particle {
-                        kind: PKind::Drop,
-                        x: x + a.cos() * 5.0,
-                        y: y - hgt,
-                        vx: a.cos() * 22.0,
-                        vy: -18.0 + a.sin() * 6.0,
-                        life: 0.4,
-                        max: 0.4,
-                    });
-                }
-            }
         }
+        let _ = (x, y);
 
         let water_mul = if on_land { 1.0 } else { 0.8 };
         let st = self.ducks[i].st;
@@ -1275,7 +1348,24 @@ impl Scene {
                             (true, Some(pd)) => (pd.x, pd.y, rad * 0.4),
                             _ => (self.ducks[i].home.0, self.ducks[i].home.1, rad),
                         };
-                        let (tx, ty) = self.clamp(hx + a.cos() * rad, hy + a.sin() * rad * 0.6);
+                        // try a few spots; prefer one that doesn't zig-zag
+                        // between water and lily pads
+                        let mut best = self.clamp(hx + a.cos() * rad, hy + a.sin() * rad * 0.6);
+                        let mut best_c = self.crossings((x, y), best);
+                        for _ in 0..5 {
+                            if best_c == 0 {
+                                break;
+                            }
+                            let a = self.rng.range(0.0, 6.283);
+                            let rad = self.rng.range(4.0, ROAM) * if anchored { 0.4 } else { 1.0 };
+                            let c = self.clamp(hx + a.cos() * rad, hy + a.sin() * rad * 0.6);
+                            let n = self.crossings((x, y), c);
+                            if n < best_c {
+                                best = c;
+                                best_c = n;
+                            }
+                        }
+                        let (tx, ty) = best;
                         self.ducks[i].st = St::Wander(tx, ty);
                     } else if r < sleep_p {
                         let d = &mut self.ducks[i];
@@ -1356,7 +1446,7 @@ impl Scene {
                         d.right = cx > tx;
                         if d.slot == 0 {
                             d.st = St::Eat(id);
-                            d.timer = 0.8;
+                            d.timer = EAT_BITE;
                         } else {
                             d.st = St::Wait(id);
                             d.timer = self.rng.range(1.5, 4.0);
@@ -1400,31 +1490,34 @@ impl Scene {
                     self.next_crumb_or_idle(i);
                     return;
                 };
-                // shuffle a little if someone is crowding, but keep facing the crumb
-                let (px, py) = self.sep.get(i).copied().unwrap_or((0.0, 0.0));
+                // hold still with the bill on the bread; the others keep their distance
                 let d = &mut self.ducks[i];
-                d.x += (px * 0.25 * dt).clamp(-0.6, 0.6);
-                d.y += (py * 0.25 * dt).clamp(-0.4, 0.4);
                 d.vx = 0.0;
                 d.vy = 0.0;
-                d.right = cx > d.x;
+                d.right = d.side < 0.0;
+                let _ = cx;
                 d.dir = if d.right { 0 } else { 4 };
                 self.ducks[i].timer -= dt;
                 if self.ducks[i].timer <= 0.0 {
                     if let Some(c) = self.crumbs.iter_mut().find(|c| c.id == id) {
                         c.bites = c.bites.saturating_sub(1);
                     }
-                    // a happy quack after every bite, crumbs flying
-                    self.ducks[i].quack = 0.35;
+                    // a happy munch (^ ^) and a quack after every bite, crumbs flying
+                    self.ducks[i].quack = MUNCH;
                     self.voice(i);
-                    let (dx, dy, r) = (self.ducks[i].x, self.ducks[i].y, self.ducks[i].right);
-                    let bx = dx + if r { 7.0 } else { -7.0 };
+                    let (dx, dy) = (self.ducks[i].x, self.ducks[i].y);
+                    let (bx, by) = self
+                        .crumbs
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| (c.x, c.y - 1.0))
+                        .unwrap_or((dx, dy - 2.0));
                     for _ in 0..2 {
                         let vx = self.rng.range(-14.0, 14.0);
                         self.particles.push(Particle {
                             kind: PKind::Crumb,
                             x: bx,
-                            y: dy - 2.0,
+                            y: by,
                             vx,
                             vy: -22.0,
                             life: 0.35,
@@ -1449,7 +1542,7 @@ impl Scene {
                             .filter(|&j| j != i && matches!(self.ducks[j].st, St::Wait(c) | St::Seek(c) if c == id))
                             .collect();
                         if waiting.is_empty() {
-                            self.ducks[i].timer = 0.8;
+                            self.ducks[i].timer = EAT_BITE;
                         } else {
                             for &j in &waiting {
                                 let d = &mut self.ducks[j];
@@ -1510,7 +1603,7 @@ impl Scene {
     /// and then.
     fn update_wake(&mut self, i: usize, dt: f32) {
         let d = &self.ducks[i];
-        if d.hatch < 1.0 || d.st == St::Held || self.is_land(d.x, d.y) || self.ripples.len() > 400 {
+        if d.hatch < 1.0 || d.st == St::Held || d.land || d.jump.is_some() || self.ripples.len() > 400 {
             return;
         }
         let speed = d.vx.hypot(d.vy);
@@ -1552,6 +1645,15 @@ impl Scene {
     /// off as it arrives, and edges around neighbours. True on arrival.
     fn step(&mut self, i: usize, tx: f32, ty: f32, max_speed: f32, dt: f32) -> bool {
         let homing = self.ducks[i].st == St::Home;
+        {
+            let d = &mut self.ducks[i];
+            let busy = d.cross > 0.0 || d.jump.is_some() || (d.land && d.shake > 0.0 && !homing);
+            if busy {
+                d.vx = 0.0;
+                d.vy = 0.0;
+                return false;
+            }
+        }
         let (px, py) = if homing {
             (0.0, 0.0)
         } else {
@@ -1582,17 +1684,142 @@ impl Scene {
         d.vy += (wy - d.vy) * turn;
         // don't overshoot the target in one tick
         let step = d.vx.hypot(d.vy) * dt;
-        if step > dist && px == 0.0 && py == 0.0 {
-            d.x = tx;
-            d.y = ty;
+        let (nx, ny) = if step > dist && px == 0.0 && py == 0.0 {
+            (tx, ty)
         } else {
-            d.x += d.vx * dt;
-            d.y += d.vy * dt;
+            (d.x + d.vx * dt, d.y + d.vy * dt)
+        };
+        // leaving the water for a lily pad (or the other way round)?
+        let (w, h) = (self.w, self.h);
+        let at = |x: f32, y: f32| land_at(&self.land, w, h, x, y);
+        let d = &self.ducks[i];
+        if at(nx, ny) != d.land {
+            let cur = d.land;
+            let (ux, uy) = {
+                let (mx, my) = (nx - d.x, ny - d.y);
+                let m = mx.hypot(my).max(0.001);
+                (mx / m, my / m)
+            };
+            // how far does the other side go along this heading?
+            let first = (1..=6).map(|s| s as f32).find(|&s| at(d.x + ux * s, d.y + uy * s) != cur);
+            let first = first.unwrap_or(1.0);
+            let back = (first as i32 + 1..=48)
+                .map(|s| s as f32)
+                .find(|&s| at(d.x + ux * s, d.y + uy * s) == cur);
+            let target_there = at(tx, ty) != cur && dist <= back.unwrap_or(f32::MAX);
+            let fast = homing;
+            let d = &mut self.ducks[i];
+            match back {
+                // a sliver of the other stuff in the way: hop straight over it
+                Some(b) if b - first < GAP && !target_there => {
+                    let to = (d.x + ux * (b + 1.5), d.y + uy * (b + 1.5));
+                    d.jump = Some(((d.x, d.y), to, cur));
+                    d.hop = HOP;
+                }
+                _ => {
+                    // stop at the edge, look, then hop across
+                    let to = (d.x + ux * (first + 2.5), d.y + uy * (first + 2.5));
+                    d.jump = None;
+                    d.cross = if fast { 0.08 } else if cur { 0.2 } else { 0.4 };
+                    d.vx = 0.0;
+                    d.vy = 0.0;
+                    // remember where we're going; the hop starts when `cross` runs out
+                    d.hop_to = Some((to, !cur));
+                }
+            }
+            return false;
         }
+        let d = &mut self.ducks[i];
+        d.x = nx;
+        d.y = ny;
         if d.vx.abs() > 2.0 {
             d.right = d.vx > 0.0;
         }
         false
+    }
+
+    /// Run a duck's edge crossing: the pause, the hop, and what happens on
+    /// landing (a shake-off on a lily pad, a splash in the water).
+    fn update_crossing(&mut self, i: usize, dt: f32) {
+        let d = &mut self.ducks[i];
+        if d.cross > 0.0 {
+            d.cross -= dt;
+            if d.cross <= 0.0 {
+                d.cross = 0.0;
+                if let Some((to, to_land)) = d.hop_to.take() {
+                    d.jump = Some(((d.x, d.y), to, to_land));
+                    d.hop = HOP;
+                }
+            }
+            return;
+        }
+        let Some((from, to, to_land)) = d.jump else {
+            return;
+        };
+        d.hop = (d.hop - dt).max(0.0);
+        let k = 1.0 - d.hop / HOP;
+        d.x = from.0 + (to.0 - from.0) * k;
+        d.y = from.1 + (to.1 - from.1) * k;
+        if to.0 > from.0 + 0.5 {
+            d.right = true;
+        } else if to.0 < from.0 - 0.5 {
+            d.right = false;
+        }
+        if d.hop > 0.0 {
+            return;
+        }
+        let was = d.land;
+        d.jump = None;
+        d.land = to_land;
+        let (x, y, baby) = (d.x, d.y, d.baby);
+        if to_land && !was {
+            // climbed out: shake clean before going anywhere
+            d.shake = 0.45;
+            for k in 0..5 {
+                let a = k as f32 * 1.26 + 0.3;
+                let hgt = if baby { 7.0 } else { 13.0 };
+                self.particles.push(Particle {
+                    kind: PKind::Drop,
+                    x: x + a.cos() * 5.0,
+                    y: y - hgt,
+                    vx: a.cos() * 22.0,
+                    vy: -18.0 + a.sin() * 6.0,
+                    life: 0.4,
+                    max: 0.4,
+                });
+            }
+        } else if !to_land {
+            // plop
+            self.ripples.push(Ripple { x, y, r: 1.5, life: 0.7 });
+            if was {
+                self.ripples.push(Ripple { x, y, r: 0.5, life: 0.5 });
+            }
+        }
+    }
+
+    /// How many times a straight walk from a to b changes between water and
+    /// land (slivers under GAP px don't count; ducks hop those).
+    fn crossings(&self, a: (f32, f32), b: (f32, f32)) -> u32 {
+        let len = (b.0 - a.0).hypot(b.1 - a.1);
+        let n = (len / 2.0).ceil().max(1.0) as i32;
+        let mut cur = self.is_land(a.0, a.1);
+        let mut run = 0.0;
+        let mut count = 0;
+        for k in 1..=n {
+            let t = k as f32 / n as f32;
+            let here = self.is_land(a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            if here != cur {
+                run += 2.0;
+                if run >= GAP {
+                    cur = here;
+                    run = 0.0;
+                    count += 1;
+                }
+            } else {
+                run = 0.0;
+            }
+        }
+        count
     }
 
     /// Personal space: a push away from close neighbours for every duck that
@@ -1635,8 +1862,10 @@ impl Scene {
     /// (sheet column, mirrored?) for a duck right now.
     fn frame_for(&self, d: &Duck) -> (usize, bool) {
         use Frame as F;
-        let water = !self.is_land(d.x, d.y);
-        let moving = matches!(d.st, St::Wander(..) | St::Seek(_) | St::Home | St::Follow);
+        // mid-hop the whole duck is out of the water
+        let water = !d.land && d.jump.is_none();
+        let moving = matches!(d.st, St::Wander(..) | St::Seek(_) | St::Home | St::Follow)
+            || d.jump.is_some();
         let fast = d.st == St::Home;
         let side_flip = !d.right;
         if d.st == St::Held {
@@ -1659,6 +1888,26 @@ impl Scene {
                 _ => (Some(2), true), // 5: NW
             }
         };
+        // hopping between water and a lily pad: crouch, flap through the
+        // air, crouch on landing; then a wing-flutter shake on the pad
+        let hop_pose = if d.jump.is_some() {
+            Some(if d.hop > HOP - 0.07 || d.hop < 0.07 { 1 } else { 0 })
+        } else if d.land && d.shake > 0.0 {
+            Some(if ((d.shake / 0.07) as i32) % 2 == 0 { 0 } else { 2 })
+        } else {
+            None
+        };
+        if let Some(p) = hop_pose {
+            let fr = match (view, p) {
+                (Some(v), 0) => VIEW_BASE + v * VIEW_FRAMES + 8,
+                (Some(v), 1) => VIEW_BASE + v * VIEW_FRAMES + 9,
+                (Some(v), _) => VIEW_BASE + v * VIEW_FRAMES,
+                (None, 0) => F::Flap as usize,
+                (None, 1) => F::Squash as usize,
+                (None, _) => F::Idle as usize,
+            };
+            return (fr, flip);
+        }
         if let Some(v) = view {
             let base = VIEW_BASE + v * VIEW_FRAMES;
             let k = if water {
@@ -1685,11 +1934,15 @@ impl Scene {
         let fr = if water {
             if let St::Eat(_) = d.st {
                 if d.quack > 0.0 {
-                    F::Swim1 as usize
-                } else if (d.anim * 2.5) as i32 % 2 == 0 {
-                    F::Dabble as usize
+                    if ((d.quack / 0.1) as i32) % 2 == 0 {
+                        F::Munchw as usize
+                    } else {
+                        F::Munchw2 as usize
+                    }
+                } else if ((d.timer * 7.0) as i32) % 3 == 2 {
+                    F::Dabble2 as usize
                 } else {
-                    F::Swim1 as usize
+                    F::Dabble as usize
                 }
             } else if d.st == St::Sleep {
                 if ((d.anim / 1.5) as i32) % 2 == 0 {
@@ -1713,12 +1966,19 @@ impl Scene {
                     F::Swim2 as usize
                 }
             }
+        } else if let (St::Eat(_), true) = (d.st, d.quack > 0.0) {
+            if ((d.quack / 0.1) as i32) % 2 == 0 {
+                F::Munch as usize
+            } else {
+                F::Munch2 as usize
+            }
         } else if d.quack > 0.0 {
             F::Quack as usize
         } else {
             match d.st {
+                // peck, peck, lift... then the bite and a munch
                 St::Eat(_) => {
-                    if (d.anim * 5.0) as i32 % 2 == 0 {
+                    if ((d.timer * 7.0) as i32) % 3 == 2 {
                         F::Peck1 as usize
                     } else {
                         F::Peck2 as usize
@@ -1902,7 +2162,7 @@ impl Scene {
                 0.0
             };
             let hop = hop.round() as i32;
-            let on_land = self.is_land(d.x, d.y);
+            let on_land = d.land;
 
             // soft shadow on land / when lifted
             if on_land || held_lift > 0 || drop > 0 || hop > 0 {
@@ -1914,7 +2174,7 @@ impl Scene {
                     blend(frame, w, h, fx + sx, fy + 2, [30, 24, 60, 35]);
                 }
             }
-            if Some(i) == self.selected {
+            if Some(i) == self.selected || self.spotted() == Some(i) {
                 let ring = if d.baby { 8.0 } else { 13.0 };
                 for s in 0..36 {
                     if s % 2 == 0 {
@@ -2269,7 +2529,7 @@ impl Scene {
         if self.show_labels {
             tags.extend(self.order.iter().copied());
         }
-        for o in [self.selected, self.hover].into_iter().flatten() {
+        for o in [self.selected, self.hover, self.spotted()].into_iter().flatten() {
             tags.retain(|&t| t != o);
             if !self.hires_tags {
                 tags.push(o);
@@ -2286,7 +2546,9 @@ impl Scene {
                 } else {
                     ytop
                 };
-                let strong = Some(i) == self.selected || Some(i) == self.hover;
+                let strong = Some(i) == self.selected
+                    || Some(i) == self.hover
+                    || Some(i) == self.spotted();
                 let bg = if strong {
                     [40, 30, 70, 215]
                 } else {
@@ -2312,7 +2574,7 @@ impl Scene {
     /// in art pixels, selected first.
     pub fn hires_tag_targets(&self) -> Vec<(String, f32, f32)> {
         let mut out = vec![];
-        for i in [self.selected, self.hover].into_iter().flatten() {
+        for i in [self.selected, self.hover, self.spotted()].into_iter().flatten() {
             if out.iter().any(|(_, _, _, j)| *j == i) {
                 continue;
             }

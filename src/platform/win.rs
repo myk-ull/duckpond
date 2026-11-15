@@ -4,13 +4,13 @@
 //! gets the real Explorer context menu.
 #![allow(unused_unsafe)]
 
-use super::Outcome;
+use super::{check_new_name, edit_part, NameCheck, Outcome};
 use crate::items::{kind_for, Item};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use windows::core::{w, Interface, HSTRING, PCSTR, PCWSTR, PWSTR};
+use windows::core::{w, Interface, HSTRING, PCSTR, PCWSTR, PSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
@@ -19,6 +19,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::Common::{ITEMIDLIST, STRRET};
 use windows::Win32::UI::Shell::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use winit::window::Window;
 
@@ -34,6 +35,10 @@ const ID_FEED: u32 = OUR_FIRST + 2;
 const ID_LABELS: u32 = OUR_FIRST + 3;
 const ID_PREFS: u32 = OUR_FIRST + 4;
 const ID_CUSTOMISE: u32 = OUR_FIRST + 5;
+const ID_DUP: u32 = OUR_FIRST + 6;
+/// the shell's own "rename" verb, handled by us (its in-place editor lives
+/// in the hidden icon view)
+const ID_RENAME: u32 = OUR_FIRST + 7;
 
 thread_local! {
     /// The shell menu currently on screen, so the helper window can forward
@@ -53,6 +58,8 @@ pub struct Plat {
     helper: HWND,
     last_listing: Vec<String>,
     visible_virtuals: HashSet<String>,
+    /// finished renames / duplicates, for the pond to act on
+    done: RefCell<Vec<Outcome>>,
 }
 
 fn desktop_view() -> Option<Desk> {
@@ -404,6 +411,7 @@ impl Plat {
             helper: make_helper(),
             last_listing: vec![],
             visible_virtuals: HashSet::new(),
+            done: RefCell::new(vec![]),
         }
     }
 
@@ -684,10 +692,85 @@ impl Plat {
     pub fn trash(&self, key: &str) {
         self.invoke_verb(key, b"delete\0")
     }
-    /// Renaming lives in the Properties sheet (the in-place editor belongs to
-    /// the hidden icon view).
+    pub fn poll(&mut self) -> Vec<Outcome> {
+        std::mem::take(&mut *self.done.borrow_mut())
+    }
+
+    /// Rename like Explorer: the whole name shows with only the part before
+    /// the extension selected, so typing over it keeps ".mov".
     pub fn rename(&self, key: &str) {
-        self.invoke_verb(key, b"properties\0")
+        let path = PathBuf::from(key);
+        if !path.exists() {
+            // virtual items (This PC, Recycle Bin): the Properties sheet
+            return self.invoke_verb(key, b"properties\0");
+        }
+        let Some(old) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            return;
+        };
+        let is_dir = path.is_dir();
+        let sel = edit_part(&old, is_dir).encode_utf16().count();
+        let Some(typed) = rename_box(self.helper, &old, sel) else {
+            return;
+        };
+        let new = match check_new_name(&old, &typed, is_dir) {
+            NameCheck::Ok(n) => n,
+            NameCheck::Bad(m) => return warn(self.helper, &m),
+            NameCheck::AskExt { keep, change, .. } => {
+                let r = message(
+                    self.helper,
+                    "If you change a file name extension, the file might become unusable.\n\nAre you sure you want to change it?",
+                    MB_ICONWARNING | MB_YESNO,
+                );
+                if r == IDYES { change } else { keep }
+            }
+        };
+        if new == old {
+            return;
+        }
+        let dst = path.with_file_name(&new);
+        if dst.exists() && new.to_lowercase() != old.to_lowercase() {
+            return warn(
+                self.helper,
+                &format!("There is already a file with the name “{new}” in this location."),
+            );
+        }
+        if let Err(e) = std::fs::rename(&path, &dst) {
+            return warn(self.helper, &format!("Couldn't rename “{old}”: {e}"));
+        }
+        self.done.borrow_mut().push(Outcome::Renamed {
+            old: key.to_string(),
+            new: dst.to_string_lossy().to_string(),
+        });
+    }
+
+    /// Duplicate the way Explorer names copies ("name - Copy.ext"); the
+    /// copy's duck lands beside the original.
+    pub fn duplicate(&self, key: &str) {
+        let src = PathBuf::from(key);
+        let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            return;
+        };
+        if !src.exists() {
+            return;
+        }
+        let is_dir = src.is_dir();
+        let stem = edit_part(&name, is_dir).to_string();
+        let ext = name[stem.len()..].to_string();
+        let mut dst = src.with_file_name(format!("{stem} - Copy{ext}"));
+        let mut n = 2;
+        while dst.exists() {
+            dst = src.with_file_name(format!("{stem} - Copy ({n}){ext}"));
+            n += 1;
+        }
+        let ok = if is_dir { copy_dir(&src, &dst).is_ok() } else { std::fs::copy(&src, &dst).is_ok() };
+        if ok {
+            self.done.borrow_mut().push(Outcome::Duplicated {
+                src: key.to_string(),
+                new: dst.to_string_lossy().to_string(),
+            });
+        } else {
+            warn(self.helper, &format!("Couldn't duplicate “{name}”."));
+        }
     }
 
     pub fn import_drop(&self, src: &Path) -> Option<String> {
@@ -742,6 +825,10 @@ impl Plat {
             )
             .0 as u32;
             ACTIVE_MENU.with(|c| *c.borrow_mut() = None);
+            if cmd >= 1 && cmd < OUR_FIRST && verb_of(cm, cmd - 1).as_deref() == Some("rename") {
+                let _ = DestroyMenu(menu);
+                return ID_RENAME;
+            }
             if cmd >= 1 && cmd < OUR_FIRST {
                 let verb = (cmd - 1) as usize;
                 let info = CMINVOKECOMMANDINFOEX {
@@ -763,9 +850,20 @@ impl Plat {
 
     pub fn show_item_menu(&mut self, _window: &Window, key: &str) -> Outcome {
         match self.item_menu(key) {
-            Some(cm) => match self.track(&cm, &[(ID_CUSTOMISE, "Customise this duck…")]) {
+            Some(cm) => match self.track(
+                &cm,
+                &[(ID_DUP, "Duplicate"), (ID_CUSTOMISE, "Customise this duck…")],
+            ) {
                 0 => Outcome::None,
                 ID_CUSTOMISE => Outcome::Customise(key.to_string()),
+                ID_DUP => {
+                    self.duplicate(key);
+                    Outcome::None
+                }
+                ID_RENAME => {
+                    self.rename(key);
+                    Outcome::None
+                }
                 _ => Outcome::Rescan,
             },
             None => Outcome::None,
@@ -798,5 +896,188 @@ impl Plat {
             ID_PREFS => Outcome::OpenPrefs,
             _ => Outcome::Rescan,
         }
+    }
+}
+
+
+/// The language-independent verb of a shell menu command ("rename", "copy"…).
+fn verb_of(cm: &IContextMenu, id: u32) -> Option<String> {
+    let mut buf = [0u16; 64];
+    unsafe {
+        cm.GetCommandString(
+            id as usize,
+            GCS_VERBW,
+            None,
+            PSTR(buf.as_mut_ptr() as *mut u8),
+            buf.len() as u32,
+        )
+        .ok()?;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n]).to_ascii_lowercase())
+}
+
+fn message(owner: HWND, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    unsafe {
+        MessageBoxW(
+            Some(owner),
+            &HSTRING::from(text),
+            w!("Duck Pond"),
+            style | MB_SETFOREGROUND,
+        )
+    }
+}
+
+fn warn(owner: HWND, text: &str) {
+    message(owner, text, MB_ICONWARNING | MB_OK);
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let to = dst.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &to)?;
+        } else {
+            std::fs::copy(e.path(), to)?;
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------- rename box
+
+thread_local! {
+    static RENAME_DONE: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    static RENAME_EDIT: RefCell<HWND> = RefCell::new(HWND::default());
+}
+
+const RB_EDIT: i32 = 100;
+/// edit-control select range (Win32_UI_Controls isn't otherwise needed)
+const EM_SETSEL: u32 = 0x00B1;
+
+unsafe extern "system" fn rename_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let id = (wp.0 & 0xffff) as i32;
+            if id == IDOK.0 || id == IDCANCEL.0 {
+                let text = (id == IDOK.0).then(|| {
+                    let edit = RENAME_EDIT.with(|e| *e.borrow());
+                    let n = GetWindowTextLengthW(edit) as usize;
+                    let mut buf = vec![0u16; n + 1];
+                    let got = GetWindowTextW(edit, &mut buf) as usize;
+                    String::from_utf16_lossy(&buf[..got])
+                });
+                RENAME_DONE.with(|d| *d.borrow_mut() = Some(text));
+                let _ = DestroyWindow(h);
+                return LRESULT(0);
+            }
+            DefWindowProcW(h, msg, wp, lp)
+        }
+        WM_CLOSE => {
+            RENAME_DONE.with(|d| *d.borrow_mut() = Some(None));
+            let _ = DestroyWindow(h);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(h, msg, wp, lp),
+    }
+}
+
+/// A small modal "Rename" box: the full name, with the first `sel` UTF-16
+/// units (the name part) selected. None if cancelled.
+fn rename_box(owner: HWND, name: &str, sel: usize) -> Option<String> {
+    unsafe {
+        let inst = GetModuleHandleW(None).ok()?;
+        let class = w!("DuckPondRename");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(rename_proc),
+            hInstance: inst.into(),
+            lpszClassName: class,
+            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as isize as *mut _),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassW(&wc); // fails harmlessly if already registered
+        let screen = GetDC(None);
+        let k = GetDeviceCaps(Some(screen), LOGPIXELSX) as f32 / 96.0;
+        ReleaseDC(None, screen);
+        let px = |v: i32| (v as f32 * k).round() as i32;
+        let (w, h) = (px(380), px(150));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let dlg = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            class,
+            w!("Rename"),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            pt.x - w / 2,
+            pt.y - h / 2,
+            w,
+            h,
+            Some(owner),
+            None,
+            Some(inst.into()),
+            None,
+        )
+        .ok()?;
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let child = |cls: PCWSTR, text: &str, style: WINDOW_STYLE, x, y, cw, ch, id: i32| {
+            let c = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                cls,
+                &HSTRING::from(text),
+                WS_CHILD | WS_VISIBLE | style,
+                px(x),
+                px(y),
+                px(cw),
+                px(ch),
+                Some(dlg),
+                Some(HMENU(id as isize as *mut _)),
+                Some(inst.into()),
+                None,
+            )
+            .unwrap_or_default();
+            SendMessageW(c, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            c
+        };
+        child(w!("STATIC"), &format!("Rename “{name}” to:"), WINDOW_STYLE(0), 12, 10, 350, 18, -1);
+        let edit = child(
+            w!("EDIT"),
+            name,
+            WS_BORDER | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            12,
+            32,
+            350,
+            24,
+            RB_EDIT,
+        );
+        child(
+            w!("BUTTON"),
+            "Rename",
+            WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+            196,
+            72,
+            80,
+            26,
+            IDOK.0,
+        );
+        child(w!("BUTTON"), "Cancel", WS_TABSTOP, 282, 72, 80, 26, IDCANCEL.0);
+        RENAME_EDIT.with(|e| *e.borrow_mut() = edit);
+        RENAME_DONE.with(|d| *d.borrow_mut() = None);
+        let _ = SetForegroundWindow(dlg);
+        let _ = SetFocus(Some(edit));
+        SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(sel as isize)));
+        let mut msg = MSG::default();
+        while RENAME_DONE.with(|d| d.borrow().is_none()) {
+            if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                break;
+            }
+            if !IsDialogMessageW(dlg, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        RENAME_DONE.with(|d| d.borrow_mut().take()).flatten()
     }
 }

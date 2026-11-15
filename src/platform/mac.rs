@@ -2,7 +2,7 @@
 //! icons switched off, and Finder-equivalent actions on each duck.
 #![allow(unused_unsafe)]
 
-use super::Outcome;
+use super::{check_new_name, edit_part, NameCheck, Outcome};
 use crate::items::{kind_for, Item};
 use objc2::AnyThread;
 use objc2_app_kit::{NSSound, NSView, NSWindowCollectionBehavior, NSWorkspace};
@@ -24,6 +24,9 @@ pub struct Plat {
     desktop: PathBuf,
     scale: f64,
     open_with: Vec<String>,
+    /// results of work finished off the main thread (renames, duplicates)
+    tx: std::sync::mpsc::Sender<Outcome>,
+    rx: std::sync::mpsc::Receiver<Outcome>,
 }
 
 fn osa(script: &str) -> Option<String> {
@@ -35,6 +38,14 @@ fn osa(script: &str) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A Finder-style warning (blocks: call from a worker thread).
+fn alert(msg: &str) {
+    let _ = osa(&format!(
+        "tell application \"Finder\"\nactivate\ndisplay alert \"{}\" as warning\nend tell",
+        q(msg)
+    ));
 }
 
 /// Run AppleScript off the main thread so dialogs never freeze the pond.
@@ -68,11 +79,14 @@ pub fn emergency_restore() {
 
 impl Plat {
     pub fn new(scale: f64) -> Plat {
+        let (tx, rx) = std::sync::mpsc::channel();
         Plat {
             desktop: dirs::desktop_dir()
                 .unwrap_or_else(|| dirs::home_dir().unwrap().join("Desktop")),
             scale,
             open_with: vec![],
+            tx,
+            rx,
         }
     }
 
@@ -200,16 +214,88 @@ impl Plat {
         ));
     }
 
+    /// Finished renames / duplicates, for the pond to act on.
+    pub fn poll(&mut self) -> Vec<Outcome> {
+        self.rx.try_iter().collect()
+    }
+
+    /// Rename like Finder: the box starts with just the name part, so typing
+    /// over it keeps ".mov"; typing a different extension asks first.
     pub fn rename(&self, key: &str) {
-        let name = Path::new(key)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        osa_bg(format!(
-            "tell application \"Finder\"\nactivate\nset r to display dialog \"Rename “{n}” to:\" default answer \"{n}\" buttons {{\"Cancel\", \"Rename\"}} default button \"Rename\" with title \"Duck Pond\"\nset name of {f} to (text returned of r)\nend tell",
-            n = q(&name),
-            f = file_ref(key)
-        ));
+        let (key, tx) = (key.to_string(), self.tx.clone());
+        std::thread::spawn(move || {
+            let path = PathBuf::from(&key);
+            let Some(old) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                return;
+            };
+            let is_dir = path.is_dir();
+            let start = edit_part(&old, is_dir);
+            let kept = &old[start.len()..];
+            let hint = if kept.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n“{kept}” is kept unless you type a different one.")
+            };
+            let Some(typed) = osa(&format!(
+                "tell application \"Finder\"\nactivate\nset r to display dialog \"Rename “{o}”:{h}\" default answer \"{d}\" buttons {{\"Cancel\", \"Rename\"}} default button \"Rename\" cancel button \"Cancel\" with title \"Duck Pond\"\nreturn text returned of r\nend tell",
+                o = q(&old),
+                h = q(&hint),
+                d = q(start)
+            )) else {
+                return;
+            };
+            let new = match check_new_name(&old, &typed, is_dir) {
+                NameCheck::Ok(n) => n,
+                NameCheck::Bad(m) => return alert(&m),
+                NameCheck::AskExt { keep, change, old_ext, new_ext } => {
+                    let pick = osa(&format!(
+                        "tell application \"Finder\"\nactivate\nset r to display dialog \"Are you sure you want to change the extension from “.{o}” to “.{n}”?\n\nIf you make this change, your file may open in a different app.\" buttons {{\"Keep .{o}\", \"Use .{n}\"}} default button \"Keep .{o}\" with title \"Duck Pond\" with icon caution\nreturn button returned of r\nend tell",
+                        o = q(&old_ext),
+                        n = q(&new_ext)
+                    ));
+                    match pick {
+                        Some(b) if b.starts_with("Use") => change,
+                        Some(_) => keep,
+                        None => return,
+                    }
+                }
+            };
+            if new == old {
+                return;
+            }
+            let dst = path.with_file_name(&new);
+            // a case-only change is the same file on a case-insensitive disk
+            if dst.exists() && new.to_lowercase() != old.to_lowercase() {
+                return alert(&format!(
+                    "The name “{new}” is already taken. Please choose a different name."
+                ));
+            }
+            if let Err(e) = std::fs::rename(&path, &dst) {
+                return alert(&format!("“{old}” couldn't be renamed: {e}"));
+            }
+            let _ = tx.send(Outcome::Renamed {
+                old: key,
+                new: dst.to_string_lossy().to_string(),
+            });
+        });
+    }
+
+    /// Duplicate like Finder ("name copy.ext"), then tell the pond where the
+    /// copy is so its duck can land beside the original.
+    pub fn duplicate(&self, key: &str) {
+        let (key, tx) = (key.to_string(), self.tx.clone());
+        std::thread::spawn(move || {
+            let script = format!(
+                "tell application \"Finder\"\nset d to duplicate {}\nreturn POSIX path of (d as alias)\nend tell",
+                file_ref(&key)
+            );
+            if let Some(p) = osa(&script) {
+                let new = p.trim_end_matches('/').to_string();
+                if !new.is_empty() {
+                    let _ = tx.send(Outcome::Duplicated { src: key, new });
+                }
+            }
+        });
     }
 
     /// Something was dragged onto the pond: move it onto the Desktop.
@@ -384,7 +470,7 @@ impl Plat {
                 let _ = Command::new("ditto").args(["-c", "-k", "--sequesterRsrc", "--keepParent"]).arg(&p).arg(dst).spawn();
                 return Outcome::Rescan;
             }
-            "duck:dup" => osa_bg(format!("tell application \"Finder\" to duplicate {f}")),
+            "duck:dup" => self.duplicate(key),
             "duck:alias" => osa_bg(format!("tell application \"Finder\" to make new alias file at desktop to {f}")),
             "duck:ql" => self.quick_look(key),
             "duck:copy" => osa_bg(format!("set the clipboard to (POSIX file \"{}\")", q(key))),

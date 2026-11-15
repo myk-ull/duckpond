@@ -11,7 +11,7 @@ import sys
 from PIL import Image
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from duck_art import ADULT, BABY, SLEEP
+from duck_art import ADULT, BABY, EAT, SLEEP
 
 W, H = 20, 18          # the duckling template size
 OUT_W, OUT_H = 30, 27  # sheet cell = the grown-up template size
@@ -73,9 +73,10 @@ PRETTY = {
 }
 # Side frames then 4 views x 8 frames, same layout the app expects.
 SIDE = ["idle", "blink", "walk1", "walk2", "walk3", "walk4", "swim1", "swim2",
-        "peck1", "peck2", "sleep", "quack", "dabble", "sleep2", "sleepw", "sleepw2"]
+        "peck1", "peck2", "sleep", "quack", "dabble", "sleep2", "sleepw", "sleepw2",
+        "munch", "munch2", "munchw", "munchw2", "dabble2", "flap", "squash"]
 VIEWS = ["s", "se", "ne", "n"]
-VIEW_FR = ["idle", "blink", "walk1", "walk2", "walk3", "walk4", "swim1", "swim2"]
+VIEW_FR = ["idle", "blink", "walk1", "walk2", "walk3", "walk4", "swim1", "swim2", "flap", "squash"]
 
 HEAD = set("HceEPYy")
 
@@ -229,8 +230,34 @@ def breathe(g):
     return up
 
 
-def side_frames(t, sleep_t):
+def happy(g):
+    """^ ^ eyes: a little arch where the open eye was."""
+    H, W = len(g), len(g[0])
+    out = [row[:] for row in g]
+    eyes = [(x, y) for y in range(H) for x in range(W) if g[y][x] in "eE"]
+    if not eyes:
+        return out
+    x0, y0 = min(x for x, _ in eyes), min(y for _, y in eyes)
+    for x, y in eyes:
+        out[y][x] = "H"
+    for x, y in ((x0 - 1, y0 + 1), (x0, y0), (x0 + 1, y0), (x0 + 2, y0 + 1)):
+        if 0 <= x < W and out[y][x] in "Hc":
+            out[y][x] = "L"
+    return out
+
+
+def dip_to_water(g):
+    """Lower the head until the bill tip just touches the waterline that
+    swim() will cut at (body bottom, after its 2 px sink)."""
+    H, W = len(g), len(g[0])
+    tip = max(y for y in range(H) for x in range(W) if g[y][x] in "Yy")
+    dy = (body_bottom(g) - 3) - tip
+    return move(g, HEAD, 0, dy) if dy > 0 else g
+
+
+def side_frames(t, sleep_t, eat):
     g = grid(t)
+    big = len(g) > 18
     f = {}
     f["idle"] = g
     f["blink"] = close_eyes(g)
@@ -238,25 +265,76 @@ def side_frames(t, sleep_t):
         f[f"walk{k}"] = walk(g, k)
     f["swim1"] = swim(g, 0)
     f["swim2"] = swim(move(g, HEAD, 0, 1), 1)
-    f["peck1"] = move(g, HEAD, 1, 3)
-    f["peck2"] = close_eyes(move(g, HEAD, 2, 5))
+    # eating: dip, bill on the bread (eyes shut in concentration), then a
+    # happy munch with ^ ^ eyes
+    half, down = grid(eat["half"]), grid(eat["down"])
+    f["peck1"] = half
+    f["peck2"] = close_eyes(down)
+    dip = close_eyes(dip_to_water(half))
+    f["dabble"] = swim(dip, 0)
+    f["dabble2"] = swim(move(dip, HEAD, 0, -1), 0)
+    munch = happy(g)
+    munch2 = quack_open(munch) if big else quack(munch)
+    f["munch"], f["munch2"] = munch, munch2
+    f["munchw"], f["munchw2"] = swim(munch, 0), swim(munch2, 0)
     sl = grid(sleep_t)
     f["sleep"] = sl
     f["sleep2"] = breathe(sl)
     f["sleepw"] = swim(sl, 0)
     f["sleepw2"] = swim(breathe(sl), 0)
-    f["quack"] = quack_open(g) if len(g) > 18 else quack(g)
-    f["dabble"] = swim(close_eyes(move(g, HEAD, 2, 5)), 0)
+    f["quack"] = quack_open(g) if big else quack(g)
+    f.update(hop_frames(g, False))
     return f
 
 
-def view_frames(t):
+def bill_tip(cell):
+    """Where the bill meets the bread: (x, y) in the cell. On land the
+    lowest, most forward bill pixel; on water the waterline under it."""
+    g, water = (cell if isinstance(cell, tuple) else (cell, None))
+    H, W = len(g), len(g[0])
+    pts = [(y, x) for y in range(H) for x in range(W) if g[y][x] in "Yym"]
+    y, x = max(pts)
+    return (x, water if water is not None else y)
+
+
+def raise_wings(g, flare):
+    """Wings up for a hop: lifted over the back (and out to the sides when
+    seen from the front or back). The body fills in underneath."""
+    H, W = len(g), len(g[0])
+    lift = 4 if H > 18 else 2
+    spread = 2 if H > 18 else 1
+    wing = [(x, y, g[y][x]) for y in range(H) for x in range(W) if g[y][x] in "Ww"]
+    if not wing:
+        return [row[:] for row in g]
+    out = [row[:] for row in g]
+    for x, y, _ in wing:
+        out[y][x] = "B"
+    mid = (min(x for x, _, _ in wing) + max(x for x, _, _ in wing)) / 2
+    for x, y, c in wing:
+        dx = (-spread if x < mid else spread) if flare else 0
+        nx, ny = x + dx, y - lift
+        if 0 <= nx < W and 0 <= ny < H and out[ny][nx] not in "HceEPYyLm":
+            out[ny][nx] = c
+    return out
+
+
+def squash(g):
+    """Crouched: everything above the feet sinks a pixel."""
+    return move(g, set("HceEPYyBbCTWwLm"), 0, 1)
+
+
+def hop_frames(g, flare):
+    return {"flap": happy(raise_wings(g, flare)), "squash": squash(g)}
+
+
+def view_frames(t, flare=False):
     g = grid(t)
     f = {"idle": g, "blink": close_eyes(g)}
     for k in range(1, 5):
         f[f"walk{k}"] = walk(g, k)
     f["swim1"] = swim(g, 0)
     f["swim2"] = swim(move(g, HEAD, 0, 1), 1)
+    f.update(hop_frames(g, flare))
     return f
 
 
@@ -345,10 +423,10 @@ def main():
     rows = [(b, baby) for b in names for baby in (False, True)]
     frames_by_set = {}
     for label, art in (("adult", ADULT), ("baby", BABY)):
-        sf = side_frames(art["side"], SLEEP[label])
+        sf = side_frames(art["side"], SLEEP[label], EAT[label])
         cells = [sf[n] for n in SIDE]
         for v in VIEWS:
-            vf = view_frames(art[v])
+            vf = view_frames(art[v], flare=v in ("s", "n"))
             cells += [vf[n] for n in VIEW_FR]
         frames_by_set[label] = cells if label == "adult" else [duckling(c) for c in cells]
     ncols = len(frames_by_set["adult"])
@@ -386,6 +464,16 @@ def main():
         for row in metas:
             fh.write("    [" + ", ".join(
                 f"Anchor {{ head_top: {m['head_top']}, eye: {m['eye']}, head: {m['head']}, beak: {m['beak']} }}" for m in row) + "],\n")
+        fh.write("];\n")
+        # where each row's bill meets the bread: [on land, on water]
+        tips = []
+        for b, baby in rows:
+            cells = frames_by_set["baby" if baby else "adult"]
+            tips.append((bill_tip(cells[SIDE.index("peck2")]), bill_tip(cells[SIDE.index("dabble")])))
+        fh.write("/// Bill tip, in cell pixels, while eating: [on land (Peck2), on water (Dabble)].\n")
+        fh.write(f"pub const EAT_TIP: [[(i32, i32); 2]; {len(rows)}] = [\n")
+        for land, water in tips:
+            fh.write(f"    [{land}, {water}],\n")
         fh.write("];\n")
 
     if len(sys.argv) > 1:
