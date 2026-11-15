@@ -1196,7 +1196,9 @@ impl App {
                 match p.duck {
                     Some(i) => {
                         if double(Target::Duck(i), &self.last_click) {
-                            let key = scene.ducks[i].key.clone();
+                            let Some(key) = scene.ducks.get(i).map(|d| d.key.clone()) else {
+                                return;
+                            };
                             if !scene::is_visitor(&key) {
                                 self.plat.open(&key);
                             }
@@ -1307,6 +1309,38 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let _ = guarded(|| self.window_event_body(el, id, event));
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let ok = guarded(|| self.about_to_wait_body(el));
+        // a skipped frame may not have scheduled the next one: keep ticking
+        if !ok && !self.exiting {
+            let wake = self
+                .next_frame
+                .min(self.next_scan)
+                .max(Instant::now() + Duration::from_millis(5));
+            el.set_control_flow(ControlFlow::WaitUntil(wake));
+        }
+    }
+
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // dev loop restarts (SIGTERM + DUCKPOND_KEEP_HIDDEN) skip the Finder
+        // restore so Finder doesn't flicker on every rebuild
+        let dev_restart =
+            STOP.load(Ordering::Relaxed) && std::env::var_os("DUCKPOND_KEEP_HIDDEN").is_some();
+        if !self.paused && !demo() && !dev_restart {
+            self.plat.set_native_icons(true);
+        }
+        self.settings.save();
+    }
+}
+
+const LOCK_ADDR: &str = "127.0.0.1:47817";
+
+/// `DuckPond --quit`: ask a running pond to close (it restores the icons).
+impl App {
+    fn window_event_body(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         #[cfg(not(windows))]
         if self.window.as_ref().map(|w| w.id()) != Some(id) {
             self.extra_event(id, event);
@@ -1538,7 +1572,7 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+    fn about_to_wait_body(&mut self, el: &ActiveEventLoop) {
         if STOP.load(Ordering::Relaxed) {
             self.exiting = true;
             el.exit();
@@ -1658,22 +1692,26 @@ impl ApplicationHandler for App {
         };
         el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
-
-    fn exiting(&mut self, _el: &ActiveEventLoop) {
-        // dev loop restarts (SIGTERM + DUCKPOND_KEEP_HIDDEN) skip the Finder
-        // restore so Finder doesn't flicker on every rebuild
-        let dev_restart =
-            STOP.load(Ordering::Relaxed) && std::env::var_os("DUCKPOND_KEEP_HIDDEN").is_some();
-        if !self.paused && !demo() && !dev_restart {
-            self.plat.set_native_icons(true);
-        }
-        self.settings.save();
-    }
 }
 
-const LOCK_ADDR: &str = "127.0.0.1:47817";
+thread_local! {
+    /// set while running guarded event handlers: a panic there is logged and
+    /// survived instead of tearing down the pond
+    static IN_GUARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// `DuckPond --quit`: ask a running pond to close (it restores the icons).
+/// Run an event handler; a bug in it skips that one event instead of
+/// aborting the app (AppKit callbacks can't unwind).
+fn guarded(f: impl FnOnce()) -> bool {
+    IN_GUARD.with(|g| g.set(true));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    IN_GUARD.with(|g| g.set(false));
+    if r.is_err() {
+        eprintln!("duck pond: skipped one event after an internal error");
+    }
+    r.is_ok()
+}
+
 fn quit_running() -> bool {
     use std::io::Write;
     match std::net::TcpStream::connect(LOCK_ADDR) {
@@ -1838,7 +1876,10 @@ fn main() {
     let _ = ctrlc::set_handler(|| STOP.store(true, Ordering::Relaxed));
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        platform::emergency_restore();
+        // a guarded handler recovers; only a real crash brings the icons back
+        if !IN_GUARD.with(|g| g.get()) {
+            platform::emergency_restore();
+        }
         default_hook(info);
     }));
 

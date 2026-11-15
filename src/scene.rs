@@ -756,7 +756,11 @@ impl Scene {
     }
 
     pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        for &i in self.order.iter().rev() {
+        // front-most first, from the live list: the draw order from the last
+        // frame can be stale (ducks leave for other displays between frames)
+        let mut idx: Vec<usize> = (0..self.ducks.len()).collect();
+        idx.sort_by(|&a, &b| self.ducks[b].y.total_cmp(&self.ducks[a].y));
+        for i in idx {
             let d = &self.ducks[i];
             if d.hatch < 1.0 {
                 continue;
