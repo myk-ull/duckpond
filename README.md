@@ -37,12 +37,15 @@ On macOS it's a native window in the style of System Settings:
   age (duckling / grown-up) and hat.
 
 With several displays, every display gets the pond. Your file ducks stay on
-the main display; a few visiting ducks live on the others and waddle across
-wherever your displays touch (following System Settings › Displays).
-Double-clicking the water sends everyone home, visitors included.
+the main display, and each other display gets its own visiting family that
+stays on that screen. Double-click a visitor and it tells you it's just
+visiting. Double-clicking the water sends everyone home, visitors included.
 
-Every change applies to the pond immediately. Ten breeds are included; white
-Pekins and yellow ducks are the default.
+Grown-ups are drawn at 30×27 pixels and ducklings at 20×18, so parents stand
+half again as tall as their babies.
+
+Every change applies to the pond immediately. Nine breeds are included. The
+default is white Pekins with their bright yellow ducklings, as in real life.
 
 ## Install / build
 

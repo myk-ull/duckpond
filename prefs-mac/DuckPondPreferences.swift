@@ -40,15 +40,15 @@ struct FilePref: Codable, Equatable {
 }
 
 struct Prefs: Codable, Equatable {
-    var version = 3
+    var version = 4
     var open_at_login = true
     var muted = false
     var volume = 0.6
     var show_labels = false
     var show_hats = false
     var day_night = true
-    var mix = ["pekin", "buttercup"]
-    var kind_breeds: [String: String] = ["folder": "pekin", "app": "pekin", "pdf": "buttercup", "doc": "buttercup", "code": "buttercup"]
+    var mix = ["pekin"]
+    var kind_breeds: [String: String] = [:]
     var kind_hats: [String: String] = [
         "folder": "straw", "image": "beret", "video": "cap", "audio": "headphones", "pdf": "mortar",
         "doc": "glasses", "code": "propeller", "archive": "party", "app": "crown", "alias": "bow", "other": "flower",
@@ -340,7 +340,7 @@ struct GeneralPane: View {
             Section {
                 Toggle(isOn: $store.prefs.all_displays) {
                     Text("Pond on every display")
-                    Text("Your file ducks stay on the main display; visiting ducks roam between screens.")
+                    Text("Your file ducks stay on the main display. Each other display gets its own visiting family, which stays on that screen. Double-click a visitor to say hello.")
                 }
                 Stepper(value: $store.prefs.visitors, in: 0...16) {
                     HStack {

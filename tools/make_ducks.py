@@ -13,13 +13,12 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from duck_art import ADULT, BABY, SLEEP
 
-W, H = 20, 18
+W, H = 20, 18          # the duckling template size
+OUT_W, OUT_H = 30, 27  # sheet cell = the grown-up template size
 
 BREEDS = {
     "pekin":        dict(body="#FFF8EC", bsh="#E6D6C0", head="#FFFBF2", wing="#F4E8D8", wsh="#D8C4AA",
                          beak="#FFA62B", ksh="#E07A12", feet="#FF9A30", cheek="#FFB0B6"),
-    "buttercup":    dict(body="#FFE35A", bsh="#F2BE2C", head="#FFEA72", wing="#FFD646", wsh="#E8B020",
-                         beak="#FF9838", ksh="#E0701A", feet="#FF8A2A", cheek="#FF9AA6"),
     "mallard_drake": dict(body="#DCD6CC", bsh="#B4AA9C", head="#2F9460", hsh="#1D6E44", wing="#A89C8C", wsh="#857A6C",
                           beak="#F3D04A", ksh="#C9A52A", feet="#FF8C30", cheek="#6FBF8A", chest="#8E553A",
                           collar="#FFFFFF", spec="#3E63D8", tail="#33343C"),
@@ -43,11 +42,9 @@ BREEDS = {
 }
 
 # Duckling fluff for every breed: soft, no adult markings, a cap / bib hint
-# where the real ducklings have one.
+# where the real ducklings have one. White Pekins hatch bright yellow.
 BABY_PAL = {
-    "pekin":         dict(body="#FFF3C2", bsh="#F2DC94", head="#FFF7D6", wing="#FBEBB0", wsh="#E8D08A",
-                          beak="#FFA94A", ksh="#E8862A", feet="#FFA040", cheek="#FF98AE"),
-    "buttercup":     dict(body="#FFDF40", bsh="#F2B820", head="#FFE760", wing="#FFD436", wsh="#E8A818",
+    "pekin":         dict(body="#FFDF40", bsh="#F2B820", head="#FFE760", wing="#FFD436", wsh="#E8A818",
                           beak="#FF8F3A", ksh="#DC6A1A", feet="#FF8A2A", cheek="#FF8EA4"),
     "mallard_drake": dict(body="#F4D35E", bsh="#C99E3E", head="#F8DE74", wing="#8E6A3C", wsh="#6E5030",
                           beak="#6E5A3A", ksh="#4E4028", feet="#C8A040", cheek="#FF9CA8", cap="#7A5A32"),
@@ -69,7 +66,7 @@ BABY_PAL = {
 
 
 PRETTY = {
-    "pekin": "White (Pekin)", "buttercup": "Yellow", "wood_duck": "Wood duck",
+    "pekin": "White (Pekin)", "wood_duck": "Wood duck",
     "mallard_drake": "Mallard", "mallard_hen": "Mallard hen", "mandarin": "Mandarin",
     "cayuga": "Cayuga", "blue_swede": "Blue Swedish", "lavender": "Lavender",
     "choc_runner": "Chocolate runner",
@@ -106,6 +103,7 @@ def blank():
 
 
 def move(g, letters, dx, dy):
+    H, W = len(g), len(g[0])
     out = [row[:] for row in g]
     moved = []
     for y in range(H):
@@ -120,6 +118,7 @@ def move(g, letters, dx, dy):
 
 
 def close_eyes(g):
+    H, W = len(g), len(g[0])
     out = [row[:] for row in g]
     for y in range(H):
         for x in range(W):
@@ -130,11 +129,13 @@ def close_eyes(g):
 
 
 def feet_rows(g):
+    H, W = len(g), len(g[0])
     return [y for y in range(H) if any(c in "fF" for c in g[y])]
 
 
 def walk(g, k):
     """k: 0 stand, 1 lift first foot, 2 bob, 3 lift second foot, 4 bob."""
+    H, W = len(g), len(g[0])
     legs = sorted({x for y in range(H) for x in range(W) if g[y][x] == "f"})
     if not legs:
         return g
@@ -169,10 +170,12 @@ def walk(g, k):
 
 
 def body_bottom(g):
+    H, W = len(g), len(g[0])
     return max(y for y in range(H) for x in range(W) if g[y][x] in "BbCWwT")
 
 
 def swim(g, phase):
+    H, W = len(g), len(g[0])
     wb = body_bottom(g)
     s = [[c if c not in "fF" else "." for c in row] for row in g]
     s = move(s, set("HceEPYyBbCTWwL"), 0, 2 + (1 if phase else 0) * 0)
@@ -185,6 +188,7 @@ def swim(g, phase):
 
 
 def quack(g):
+    H, W = len(g), len(g[0])
     out = [row[:] for row in g]
     ys = [y for y in range(H) for x in range(W) if g[y][x] == "Y"]
     if not ys:
@@ -198,8 +202,26 @@ def quack(g):
     return out
 
 
+def quack_open(g):
+    """Grown-ups: the lower jaw drops a pixel, showing a dark mouth."""
+    H, W = len(g), len(g[0])
+    out = [row[:] for row in g]
+    jaw = [(x, y) for y in range(H) for x in range(W) if g[y][x] == "y"]
+    if not jaw:
+        return quack(g)
+    hinge = min(x for x, _ in jaw)
+    for x, y in jaw:
+        if x != hinge:
+            out[y][x] = "m"
+    for x, y in jaw:
+        if y + 1 < H and out[y + 1][x] == ".":
+            out[y + 1][x] = "y"
+    return out
+
+
 def breathe(g):
     """Breathing in: the whole loaf rises a pixel, the bottom stays put."""
+    H, W = len(g), len(g[0])
     up = move(g, set("HceEPYyBbCTWwLm"), 0, -1)
     for x in range(W):
         if g[H - 1][x] != ".":
@@ -223,7 +245,7 @@ def side_frames(t, sleep_t):
     f["sleep2"] = breathe(sl)
     f["sleepw"] = swim(sl, 0)
     f["sleepw2"] = swim(breathe(sl), 0)
-    f["quack"] = quack(g)
+    f["quack"] = quack_open(g) if len(g) > 18 else quack(g)
     f["dabble"] = swim(close_eyes(move(g, HEAD, 2, 5)), 0)
     return f
 
@@ -240,6 +262,7 @@ def view_frames(t):
 
 def colourise(cell, pal, baby):
     g, water = (cell if isinstance(cell, tuple) else (cell, None))
+    H, W = len(g), len(g[0])
     body = pal["body"]
     head = pal["head"]
     col = {
@@ -289,6 +312,7 @@ def colourise(cell, pal, baby):
 
 def anchors(cell):
     g = cell[0] if isinstance(cell, tuple) else cell
+    H, W = len(g), len(g[0])
     hp = [(x, y) for y in range(H) for x in range(W) if g[y][x] in "Hc"]
     ep = [(x, y) for y in range(H) for x in range(W) if g[y][x] in "eEL"]
     bp = [(x, y) for y in range(H) for x in range(W) if g[y][x] in "Yy"]
@@ -303,6 +327,19 @@ def anchors(cell):
     return dict(head_top=(tx[len(tx) // 2], top), eye=e, head=(cx, cy), beak=beak)
 
 
+# --- sizing -----------------------------------------------------------------
+
+def duckling(cell):
+    """A 20x18 frame placed, unchanged, at the bottom-middle of a 30x27 cell."""
+    g, water = (cell if isinstance(cell, tuple) else (cell, None))
+    dx, dy = (OUT_W - W) // 2, OUT_H - H
+    out = [["."] * OUT_W for _ in range(OUT_H)]
+    for y in range(H):
+        for x in range(W):
+            out[y + dy][x + dx] = g[y][x]
+    return (out, water + dy) if water is not None else out
+
+
 def main():
     names = list(BREEDS)
     rows = [(b, baby) for b in names for baby in (False, True)]
@@ -313,9 +350,9 @@ def main():
         for v in VIEWS:
             vf = view_frames(art[v])
             cells += [vf[n] for n in VIEW_FR]
-        frames_by_set[label] = cells
+        frames_by_set[label] = cells if label == "adult" else [duckling(c) for c in cells]
     ncols = len(frames_by_set["adult"])
-    sheet = Image.new("RGBA", (W * ncols, H * len(rows)), (0, 0, 0, 0))
+    sheet = Image.new("RGBA", (OUT_W * ncols, OUT_H * len(rows)), (0, 0, 0, 0))
     metas = []
     for ri, (b, baby) in enumerate(rows):
         src = BABY_PAL[b] if baby else BREEDS[b]
@@ -324,16 +361,16 @@ def main():
         row_meta = []
         for ci, cell in enumerate(cells):
             img = colourise(cell, pal, baby)
-            for y in range(H):
-                for x in range(W):
-                    sheet.putpixel((ci * W + x, ri * H + y), img[y][x])
+            for y in range(OUT_H):
+                for x in range(OUT_W):
+                    sheet.putpixel((ci * OUT_W + x, ri * OUT_H + y), img[y][x])
             row_meta.append(anchors(cell))
         metas.append(row_meta)
     sheet.save("assets/ducks.png", optimize=True)
 
     with open("src/sprite_meta.rs", "w") as fh:
         fh.write("// @generated by tools/make_ducks.py - do not edit\n")
-        fh.write(f"pub const CELL_W: u32 = {W};\npub const CELL_H: u32 = {H};\n")
+        fh.write(f"pub const CELL_W: u32 = {OUT_W};\npub const CELL_H: u32 = {OUT_H};\n")
         fh.write(f"pub const BREEDS: [&str; {len(names)}] = {names!r};\n".replace("'", '"'))
         pretty = [PRETTY[n] for n in names]
         fh.write(f"pub const BREED_NAMES: [&str; {len(names)}] = {pretty!r};\n".replace("'", '"'))

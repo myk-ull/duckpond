@@ -133,6 +133,8 @@ pub struct Duck {
     /// happy hop after a click / shake after climbing out of the water
     hop: f32,
     shake: f32,
+    /// seconds left on a speech bubble ("quack, I'm just visiting!")
+    say: f32,
 }
 
 struct Crumb {
@@ -193,8 +195,6 @@ pub struct Scene {
     land: Vec<bool>,
     glints: Vec<(u32, f32)>,
     bg_k: u32,
-    /// which edges lead to another display: left, right, up, down
-    pub neighbors: [bool; 4],
     pub ducks: Vec<Duck>,
     crumbs: Vec<Crumb>,
     ripples: Vec<Ripple>,
@@ -237,7 +237,9 @@ struct Dragonfly {
 /// Each painting pixel covers BG_SCALE x BG_SCALE art pixels (chunkier Monet).
 pub const BG_SCALE: u32 = 2;
 /// Keep duck heads clear of the menu bar / top edge (art px).
-const TOP_MARGIN: f32 = 8.0;
+const TOP_MARGIN: f32 = 14.0;
+/// Keep ducks this far from the left/right/bottom edges (art px).
+const EDGE_MARGIN: f32 = 16.0;
 const ROAM: f32 = 26.0; // how far (art px) a duck wanders from home
 const SLOW: f32 = 11.0;
 const EAGER: f32 = 30.0;
@@ -256,7 +258,6 @@ impl Scene {
             land: vec![],
             glints: vec![],
             bg_k: 1,
-            neighbors: [false; 4],
             ducks: vec![],
             crumbs: vec![],
             ripples: vec![],
@@ -390,6 +391,7 @@ impl Scene {
             next_think: 20.0 + ((h >> 12) % 9000) as f32 / 100.0,
             hop: 0.0,
             shake: 0.0,
+            say: 0.0,
         };
         let was_land = self.is_land(d.x, d.y);
         self.ducks.push(Duck { was_land, ..d });
@@ -415,8 +417,8 @@ impl Scene {
 
     fn clamp(&self, x: f32, y: f32) -> (f32, f32) {
         (
-            x.clamp(9.0, self.w as f32 - 10.0),
-            y.clamp(CELL_H as f32 + TOP_MARGIN, self.h as f32 - 3.0),
+            x.clamp(EDGE_MARGIN, self.w as f32 - EDGE_MARGIN),
+            y.clamp(CELL_H as f32 + TOP_MARGIN, self.h as f32 - EDGE_MARGIN * 0.5),
         )
     }
 
@@ -445,7 +447,7 @@ impl Scene {
     /// files in the top-right corner). Nudge homes apart until every duck has
     /// room, moving each as little as possible. Ducks waddle to the new spot.
     pub fn relax_homes(&mut self) {
-        const D: f32 = 12.0;
+        const D: f32 = 16.0;
         let n = self.ducks.len();
         let mut homes: Vec<(f32, f32)> = self.ducks.iter().map(|d| d.home).collect();
         for _ in 0..40 {
@@ -540,7 +542,7 @@ impl Scene {
         } else {
             (if pd.right { -1.0 } else { 1.0 }, 0.0)
         };
-        let gap = 8.0 + self.ducks[i].rank as f32 * 7.0;
+        let gap = 12.0 + self.ducks[i].rank as f32 * 7.0;
         // a little sideways sway so the line isn't ruler-straight
         let sway = ((self.t * 1.3 + self.ducks[i].rank as f32).sin()) * 1.5;
         let (tx, ty) = self.clamp(
@@ -583,102 +585,19 @@ impl Scene {
     }
 
     /// A point just past an edge that leads to another display, or None.
-    fn pick_exit(&mut self, i: usize) -> Option<(f32, f32)> {
-        let open: Vec<usize> = (0..4).filter(|&e| self.neighbors[e]).collect();
-        if open.is_empty() {
-            return None;
-        }
-        let e = open[(self.rng.next() % open.len() as u64) as usize];
-        let (x, y) = (self.ducks[i].x, self.ducks[i].y);
-        let (w, h) = (self.w as f32, self.h as f32);
-        Some(match e {
-            0 => (-10.0, y),
-            1 => (w + 10.0, y),
-            2 => (x, CELL_H as f32 - 12.0),
-            _ => (x, h + 10.0),
-        })
-    }
+
 
     /// Send duck i off through `edge` (0 L / 1 R / 2 U / 3 D), ducklings in tow.
-    pub fn head_out(&mut self, i: usize, edge: u8) {
-        let (x, y) = (self.ducks[i].x, self.ducks[i].y);
-        let (w, h) = (self.w as f32, self.h as f32);
-        let exit = match edge {
-            0 => (-10.0, y),
-            1 => (w + 10.0, y),
-            2 => (x, CELL_H as f32 - 12.0),
-            _ => (x, h + 10.0),
-        };
-        self.ducks[i].st = St::Home;
-        self.ducks[i].home = exit;
-        let kids: Vec<usize> = (0..self.ducks.len())
-            .filter(|&k| self.ducks[k].parent == Some(i))
-            .collect();
-        for k in kids {
-            self.ducks[k].st = St::Home;
-            self.ducks[k].home = (exit.0, exit.1 + (k % 3) as f32 - 1.0);
-        }
-    }
+
 
     /// Visiting ducks that have walked off an edge: (duck, edge 0 L / 1 R / 2 U / 3 D).
     #[cfg_attr(windows, allow(dead_code))]
-    pub fn take_departures(&mut self) -> Vec<(Duck, u8)> {
-        let (w, h) = (self.w as f32, self.h as f32);
-        let edge = |d: &Duck| -> Option<u8> {
-            if !is_visitor(&d.key) || d.st == St::Held {
-                None
-            } else if d.x < -6.0 {
-                Some(0)
-            } else if d.x > w + 6.0 {
-                Some(1)
-            } else if d.y < CELL_H as f32 - 8.0 {
-                Some(2)
-            } else if d.y > h + 6.0 {
-                Some(3)
-            } else {
-                None
-            }
-        };
-        if !self.ducks.iter().any(|d| edge(d).is_some()) {
-            return vec![];
-        }
-        let mut out = vec![];
-        let mut keep = vec![];
-        for d in self.ducks.drain(..) {
-            match edge(&d) {
-                Some(e) => out.push((d, e)),
-                None => keep.push(d),
-            }
-        }
-        self.ducks = keep;
-        self.hover = None;
-        self.selected = None;
-        self.families_dirty = true;
-        out
-    }
+
 
     /// A visiting duck arriving through `edge` of this pond at (x, y): it
     /// waddles in a little way and makes itself at home.
     #[cfg_attr(windows, allow(dead_code))]
-    pub fn arrive(&mut self, mut d: Duck, edge: u8, x: f32, y: f32) {
-        let (w, h) = (self.w as f32, self.h as f32);
-        let inset = self.rng.range(14.0, 34.0);
-        let (sx, sy, tx, ty) = match edge {
-            0 => (-8.0, y, inset, y),
-            1 => (w + 8.0, y, w - inset, y),
-            2 => (x, CELL_H as f32 - 10.0, x, CELL_H as f32 + inset * 0.6),
-            _ => (x, h + 8.0, x, h - inset * 0.6),
-        };
-        let (tx, ty) = self.clamp(tx, ty);
-        d.x = sx;
-        d.y = sy.clamp(-20.0, h + 20.0);
-        d.home = (tx, ty);
-        d.st = St::Wander(tx, ty);
-        d.parent = None;
-        d.right = tx > sx;
-        self.ducks.push(d);
-        self.families_dirty = true;
-    }
+
 
     pub fn send_all_home(&mut self) {
         for i in 0..self.ducks.len() {
@@ -707,6 +626,14 @@ impl Scene {
             d.hop = 0.38;
         }
         self.voice(i);
+    }
+
+    /// A visiting duck introduces itself: hop, quack and a speech bubble.
+    pub fn say_visiting(&mut self, i: usize) {
+        self.wake_and_quack(i);
+        if let Some(d) = self.ducks.get_mut(i) {
+            d.say = 2.8;
+        }
     }
 
     fn voice(&mut self, i: usize) {
@@ -765,7 +692,7 @@ impl Scene {
             if d.hatch < 1.0 {
                 continue;
             }
-            let (hw, top) = if d.baby { (6.0, 12.0) } else { (8.0, 16.0) };
+            let (hw, top) = if d.baby { (6.0, 12.0) } else { (11.0, 22.0) };
             if (x - d.x).abs() <= hw && y >= d.y - top && y <= d.y + 1.5 {
                 return Some(i);
             }
@@ -886,7 +813,8 @@ impl Scene {
     fn spot(&self, i: usize, cx: f32, cy: f32) -> (f32, f32) {
         let d = &self.ducks[i];
         let k = d.slot as f32;
-        self.clamp(cx + d.side * (7.0 + 14.0 * k), cy + 0.5 + k * 2.0)
+        let reach = if d.baby { 7.0 } else { 10.0 };
+        self.clamp(cx + d.side * (reach + 16.0 * k), cy + 0.5 + k * 2.0)
     }
 
     fn crumb(&self, id: u32) -> Option<&Crumb> {
@@ -914,6 +842,7 @@ impl Scene {
                             | St::Follow
                     )
                     || d.hop > 0.0
+                    || d.say > 0.0
                     || d.think > 0.0
                     || d.shake > 0.0
             })
@@ -1038,7 +967,7 @@ impl Scene {
             {
                 let (x, y) = (
                     d.x + if d.right { 2.0 } else { -2.0 },
-                    d.y - if d.baby { 11.0 } else { 13.0 },
+                    d.y - if d.baby { 11.0 } else { 17.0 },
                 );
                 self.particles.push(Particle {
                     kind: PKind::Zed,
@@ -1267,6 +1196,7 @@ impl Scene {
             let climbed_out = !d.was_land && on_land;
             d.was_land = on_land;
             d.hop = (d.hop - dt).max(0.0);
+            d.say = (d.say - dt).max(0.0);
             d.shake = (d.shake - dt).max(0.0);
             d.think = (d.think - dt).max(0.0);
             d.next_think -= dt;
@@ -1275,7 +1205,7 @@ impl Scene {
                 let baby = d.baby;
                 for k in 0..4 {
                     let a = k as f32 * 1.57 + 0.4;
-                    let hgt = if baby { 7.0 } else { 9.0 };
+                    let hgt = if baby { 7.0 } else { 13.0 };
                     self.particles.push(Particle {
                         kind: PKind::Drop,
                         x: x + a.cos() * 5.0,
@@ -1333,22 +1263,6 @@ impl Scene {
                     let r = self.rng.f();
                     let wander_p = 0.55 - self.night * 0.3;
                     let sleep_p = wander_p + 0.08 + self.night * 0.35;
-                    // visiting ducks sometimes set off for the next display,
-                    // ducklings in tow
-                    if r < wander_p * 0.3 && is_visitor(&self.ducks[i].key) && !self.ducks[i].baby {
-                        if let Some(exit) = self.pick_exit(i) {
-                            self.ducks[i].st = St::Wander(exit.0, exit.1);
-                            let kids: Vec<usize> = (0..self.ducks.len())
-                                .filter(|&k| self.ducks[k].parent == Some(i))
-                                .collect();
-                            for k in kids {
-                                let d = &mut self.ducks[k];
-                                d.st = St::Wander(exit.0, exit.1 + (k % 3) as f32 - 1.0);
-                                d.stay = 0.0;
-                            }
-                            return;
-                        }
-                    }
                     if r < wander_p {
                         let a = self.rng.range(0.0, 6.283);
                         let rad = self.rng.range(4.0, ROAM);
@@ -1396,7 +1310,7 @@ impl Scene {
                 let (hx, hy) = self.ducks[i].home;
                 let v = SCURRY * self.ducks[i].pace;
                 if self.step(i, hx, hy, v, dt) {
-                    let top = if self.ducks[i].baby { 12.0 } else { 15.0 };
+                    let top = if self.ducks[i].baby { 12.0 } else { 22.0 };
                     let sx = self.rng.range(-6.0, 6.0);
                     self.particles.push(Particle {
                         kind: PKind::Sparkle,
@@ -1518,7 +1432,7 @@ impl Scene {
                         });
                     }
                     if self.crumb(id).is_none() {
-                        let hy = dy - if self.ducks[i].baby { 13.0 } else { 16.0 };
+                        let hy = dy - if self.ducks[i].baby { 13.0 } else { 23.0 };
                         self.particles.push(Particle {
                             kind: PKind::Heart,
                             x: dx,
@@ -1992,7 +1906,7 @@ impl Scene {
 
             // soft shadow on land / when lifted
             if on_land || held_lift > 0 || drop > 0 || hop > 0 {
-                let rx = if d.baby { 4 } else { 6 };
+                let rx = if d.baby { 4 } else { 9 };
                 for sx in -rx..=rx {
                     blend(frame, w, h, fx + sx, fy + 1, [30, 24, 60, 60]);
                 }
@@ -2001,10 +1915,11 @@ impl Scene {
                 }
             }
             if Some(i) == self.selected {
-                for s in 0..28 {
+                let ring = if d.baby { 8.0 } else { 13.0 };
+                for s in 0..36 {
                     if s % 2 == 0 {
-                        let th = s as f32 / 28.0 * std::f32::consts::TAU;
-                        let x = fx + (th.cos() * 9.0) as i32;
+                        let th = s as f32 / 36.0 * std::f32::consts::TAU;
+                        let x = fx + (th.cos() * ring) as i32;
                         let y = fy + 1 + (th.sin() * 3.0) as i32;
                         blend(frame, w, h, x, y, [255, 236, 140, 230]);
                     }
@@ -2263,6 +2178,45 @@ impl Scene {
             }
         }
 
+        // speech bubbles: "QUACK!" / "I'M JUST VISITING"
+        for &i in &self.order {
+            let Some(d) = self.ducks.get(i) else { continue };
+            if d.say <= 0.0 || d.hatch < 1.0 {
+                continue;
+            }
+            let a = ((d.say / 0.3).min(1.0) * 255.0) as u8;
+            let pop = ((2.8 - d.say) / 0.12).clamp(0.0, 1.0);
+            let lines = ["QUACK!", "I'M JUST VISITING"];
+            let tw = lines.iter().map(|l| font::text_width(l)).max().unwrap_or(0);
+            let (bw, bh) = (tw + 6, 15);
+            let head_top = d.y.round() as i32 - if d.baby { 13 } else { 23 };
+            let bx = (d.x.round() as i32 - bw / 2).clamp(2, w - bw - 2);
+            let by = (head_top - bh - 4 + ((1.0 - pop) * 3.0) as i32).max(2);
+            let ink = [120, 104, 160, a];
+            let paper = [255, 255, 255, a];
+            for yy in 0..bh {
+                for xx in 0..bw {
+                    let corner = (yy == 0 || yy == bh - 1) && (xx == 0 || xx == bw - 1);
+                    if corner {
+                        continue;
+                    }
+                    let edge = yy == 0 || yy == bh - 1 || xx == 0 || xx == bw - 1;
+                    blend(frame, w, h, bx + xx, by + yy, if edge { ink } else { paper });
+                }
+            }
+            // little tail pointing at the duck
+            let tx = d.x.round() as i32;
+            blend(frame, w, h, tx, by + bh, ink);
+            blend(frame, w, h, tx - 1, by + bh - 1, paper);
+            blend(frame, w, h, tx, by + bh - 1, paper);
+            blend(frame, w, h, tx + 1, by + bh, [120, 104, 160, a / 2]);
+            for (li, line) in lines.iter().enumerate() {
+                let lx = bx + (bw - font::text_width(line)) / 2;
+                let ly = by + 2 + li as i32 * 6;
+                font::draw(line, lx, ly, |px, py| blend(frame, w, h, px, py, [70, 50, 110, a]));
+            }
+        }
+
         // thought bubbles: a little cloud with a dream inside
         for &i in &self.order {
             let d = &self.ducks[i];
@@ -2273,7 +2227,7 @@ impl Scene {
             let fade = (d.think / 0.35).min(1.0);
             let a = (255.0 * fade) as u8;
             let s = if d.right { 1 } else { -1 };
-            let head_top = d.y.round() as i32 - if d.baby { 13 } else { 16 };
+            let head_top = d.y.round() as i32 - if d.baby { 13 } else { 23 };
             let hx = d.x.round() as i32 + s * 3;
             // trailing dots
             blend(frame, w, h, hx + s * 2, head_top - 1, [255, 255, 255, a]);
@@ -2326,7 +2280,7 @@ impl Scene {
                 let txt = font::label_for(&d.name, 22);
                 let tw = font::text_width(&txt);
                 let x = (d.x.round() as i32 - tw / 2).clamp(2, w - tw - 2);
-                let ytop = d.y.round() as i32 - CELL_H as i32 - 6;
+                let ytop = d.y.round() as i32 - if d.baby { 15 } else { 23 } - 6;
                 let y = if ytop < 2 {
                     d.y.round() as i32 + 4
                 } else {
@@ -2363,7 +2317,7 @@ impl Scene {
                 continue;
             }
             if let Some(d) = self.ducks.get(i) {
-                let top = d.y - if d.baby { 14.0 } else { CELL_H as f32 } + 1.0;
+                let top = d.y - if d.baby { 14.0 } else { 23.0 } + 1.0;
                 out.push((d.name.clone(), d.x, top, i));
             }
         }

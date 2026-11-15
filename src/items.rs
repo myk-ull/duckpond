@@ -83,21 +83,13 @@ impl Kind {
 /// "mix" means: pick from the ticked breeds, by filename.
 pub const MIX: &str = "mix";
 
+/// White ducks; their ducklings are yellow, as in real life.
 fn default_mix() -> Vec<String> {
-    vec!["pekin".into(), "buttercup".into()]
+    vec!["pekin".into()]
 }
 
 fn default_kind_breeds() -> HashMap<String, String> {
-    [
-        ("folder", "pekin"),
-        ("app", "pekin"),
-        ("pdf", "buttercup"),
-        ("doc", "buttercup"),
-        ("code", "buttercup"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
+    HashMap::new()
 }
 
 pub fn kind_for(name: &str, is_dir: bool, is_link: bool) -> Kind {
@@ -237,7 +229,7 @@ fn default_visitors() -> u32 {
     5
 }
 
-const PREFS_VERSION: u32 = 3;
+const PREFS_VERSION: u32 = 4;
 
 impl Default for Prefs {
     fn default() -> Self {
@@ -452,6 +444,24 @@ impl Settings {
                 }
             }
             migrated = true;
+        }
+        if prefs.version < 4 {
+            // v4 dropped the all-yellow grown-up ("buttercup"): real yellow
+            // ducks are ducklings, so those files become white Pekins.
+            let fix = |b: &mut String| {
+                if b == "buttercup" {
+                    *b = "pekin".into();
+                }
+            };
+            prefs.mix.iter_mut().for_each(fix);
+            let mut seen = std::collections::HashSet::new();
+            prefs.mix.retain(|b| seen.insert(b.clone()));
+            prefs.kind_breeds.values_mut().for_each(fix);
+            for f in prefs.files.values_mut() {
+                if let Some(b) = f.breed.as_mut() {
+                    fix(b);
+                }
+            }
         }
         if prefs.version < PREFS_VERSION {
             prefs.version = PREFS_VERSION;

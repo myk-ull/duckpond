@@ -118,8 +118,6 @@ struct App {
     extras: Vec<Extra>,
     next_displays: Instant,
     hour: f32,
-    /// visiting ducks on their way back to their own display
-    homing: HashSet<String>,
     home_requested: bool,
     #[cfg_attr(windows, allow(dead_code))]
     visitor_serial: u32,
@@ -132,34 +130,13 @@ struct Extra {
     window: Arc<Window>,
     pixels: Pixels<'static>,
     scene: Scene,
-    factor: u32,
-    /// monitor rectangle in physical pixels of the desktop
-    rect: (i32, i32, u32, u32),
     cursor: (f32, f32),
     last_click: Option<(Instant, (f32, f32))>,
 }
 
 /// Which edges of `a` touch another display: left, right, up, down.
-fn touching(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32), edge: u8) -> bool {
-    const SLACK: i32 = 48;
-    let (ax, ay, aw, ah) = (a.0, a.1, a.2 as i32, a.3 as i32);
-    let (bx, by, bw, bh) = (b.0, b.1, b.2 as i32, b.3 as i32);
-    let v_overlap = ay < by + bh && by < ay + ah;
-    let h_overlap = ax < bx + bw && bx < ax + aw;
-    match edge {
-        0 => v_overlap && (bx + bw - ax).abs() < SLACK,
-        1 => v_overlap && (ax + aw - bx).abs() < SLACK,
-        2 => h_overlap && (by + bh - ay).abs() < SLACK,
-        _ => h_overlap && (ay + ah - by).abs() < SLACK,
-    }
-}
 
-fn visitor_origin(key: &str) -> &str {
-    key.strip_prefix("visitor:")
-        .and_then(|r| r.rsplit_once('#'))
-        .map(|(o, _)| o)
-        .unwrap_or("")
-}
+
 
 fn save_png(path: &str, w: u32, h: u32, rgba: &[u8], k: u32) {
     let (bw, bh) = (w * k, h * k);
@@ -226,7 +203,6 @@ impl App {
             extras: vec![],
             next_displays: now + Duration::from_secs(2),
             hour: 14.0,
-            homing: HashSet::new(),
             home_requested: false,
             visitor_serial: 0,
         }
@@ -642,164 +618,59 @@ impl App {
 
     /// Every pond's rectangle (physical desktop pixels) and art scale.
     /// Index 0 is the main pond.
-    fn pond_rects(&self) -> Vec<((i32, i32, u32, u32), u32, String)> {
-        let mut v = vec![];
-        if let Some(w) = &self.window {
-            let p = w.outer_position().map(|p| (p.x, p.y)).unwrap_or((0, 0));
-            let s = w.inner_size();
-            v.push((
-                (p.0, p.1, s.width, s.height),
-                self.factor,
-                "main".to_string(),
-            ));
-        }
-        #[cfg(not(windows))]
-        for e in &self.extras {
-            v.push((e.rect, e.factor, e.id.clone()));
-        }
-        v
-    }
 
-    fn pond_scene(&mut self, i: usize) -> Option<&mut Scene> {
-        if i == 0 {
-            return self.scene.as_mut();
-        }
-        #[cfg(not(windows))]
-        {
-            return self.extras.get_mut(i - 1).map(|e| &mut e.scene);
-        }
-        #[allow(unreachable_code)]
-        None
-    }
+
+
 
     /// Double-click / "Send Ducks Home": file ducks return to their icons;
     /// visiting ducks head back to the display they came from.
-    fn send_everyone_home(&mut self) {
-        let rects = self.pond_rects();
-        for i in 0..rects.len() {
-            if let Some(s) = self.pond_scene(i) {
-                s.send_all_home();
-            }
-        }
-        self.homing.clear();
-        for i in 0..rects.len() {
-            let here = rects[i].2.clone();
-            let keys: Vec<String> = match self.pond_scene(i) {
-                Some(s) => s
-                    .ducks
-                    .iter()
-                    .filter(|d| scene::is_visitor(&d.key) && visitor_origin(&d.key) != here)
-                    .map(|d| d.key.clone())
-                    .collect(),
-                None => vec![],
-            };
-            for k in keys {
-                self.homing.insert(k.clone());
-                self.steer_home(i, &k, &rects);
-            }
-        }
-    }
+
 
     /// Point a visiting duck in pond `i` at the edge that leads towards its
     /// own display (one hop at a time, along the real display layout).
-    fn steer_home(&mut self, i: usize, key: &str, rects: &[((i32, i32, u32, u32), u32, String)]) {
-        let origin = visitor_origin(key).to_string();
-        let Some(target) = rects.iter().find(|r| r.2 == origin).map(|r| r.0) else {
-            self.homing.remove(key);
-            return;
-        };
-        let here = rects[i].0;
-        let (cx, cy) = (here.0 + here.2 as i32 / 2, here.1 + here.3 as i32 / 2);
-        let (tx, ty) = (
-            target.0 + target.2 as i32 / 2,
-            target.1 + target.3 as i32 / 2,
-        );
-        let (dx, dy) = (tx - cx, ty - cy);
-        // try the main direction first, then the other axis
-        let mut order: Vec<u8> = if dx.abs() >= dy.abs() {
-            vec![if dx < 0 { 0 } else { 1 }, if dy < 0 { 2 } else { 3 }]
-        } else {
-            vec![if dy < 0 { 2 } else { 3 }, if dx < 0 { 0 } else { 1 }]
-        };
-        order.extend([0, 1, 2, 3]);
-        let edge = order.into_iter().find(|&e| {
-            rects
-                .iter()
-                .enumerate()
-                .any(|(j, r)| j != i && touching(here, r.0, e))
-        });
-        if let (Some(edge), Some(s)) = (edge, self.pond_scene(i)) {
-            if let Some(di) = s.find(key) {
-                s.head_out(di, edge);
-            }
-        }
-    }
+
 
     /// Hand visiting ducks that walked off one display to the display next door.
     #[cfg(not(windows))]
-    fn route_departures(&mut self) {
-        let rects = self.pond_rects();
-        let mut moving = vec![];
-        for i in 0..rects.len() {
-            if let Some(s) = self.pond_scene(i) {
-                for (d, edge) in s.take_departures() {
-                    let ((rx, ry, _, _), f, _) = rects[i];
-                    let (gx, gy) = (rx as f32 + d.x * f as f32, ry as f32 + d.y * f as f32);
-                    moving.push((i, d, edge, gx, gy));
-                }
-            }
-        }
-        for (from, d, edge, gx, gy) in moving {
-            let key = d.key.clone();
-            // the display touching that edge (closest along the crossing)
-            let to = (0..rects.len())
-                .filter(|&j| j != from && touching(rects[from].0, rects[j].0, edge))
-                .min_by_key(|&j| {
-                    let r = rects[j].0;
-                    let (cx, cy) = (r.0 + r.2 as i32 / 2, r.1 + r.3 as i32 / 2);
-                    ((cx as f32 - gx).abs() + (cy as f32 - gy).abs()) as i64
-                });
-            let (j, in_edge) = match to {
-                Some(j) => (j, [1u8, 0, 3, 2][edge as usize]),
-                None => (from, edge), // nowhere to go: turn back
-            };
-            let ((rx, ry, _, _), f, ref name) = rects[j];
-            let arrived_home = name == visitor_origin(&key);
-            if let Some(s) = self.pond_scene(j) {
-                let (ax, ay) = ((gx - rx as f32) / f as f32, (gy - ry as f32) / f as f32);
-                let (w, h) = (s.w as f32, s.h as f32);
-                s.arrive(d, in_edge, ax.clamp(4.0, w - 4.0), ay.clamp(20.0, h - 4.0));
-            }
-            if self.homing.contains(&key) {
-                if arrived_home {
-                    self.homing.remove(&key);
-                } else {
-                    self.steer_home(j, &key, &rects);
-                }
-            }
-        }
-    }
+
 
     /// One pond per extra display; add/remove as displays come and go, and
     /// keep the right number of visiting ducks.
     #[cfg(not(windows))]
     fn sync_displays(&mut self, el: &ActiveEventLoop) {
+        let id_of = |m: &winit::monitor::MonitorHandle| {
+            let (p, z) = (m.position(), m.size());
+            format!("{}_{}_{}x{}", p.x, p.y, z.width, z.height)
+        };
+        // The main pond always covers the main display. Plugging or
+        // unplugging screens can resize it or move its origin, and macOS
+        // leaves our window where it was, so refit it here. The Resized
+        // event rebuilds the surface and the next rescan re-reads the icons.
+        let primary = el
+            .primary_monitor()
+            .or_else(|| el.available_monitors().next());
+        if let (Some(mon), Some(win)) = (&primary, &self.window) {
+            let (p, z) = (mon.position(), mon.size());
+            let at = win.outer_position().ok();
+            let off = at.map_or(true, |q| (q.x - p.x).abs() > 2 || (q.y - p.y).abs() > 2);
+            let wrong_size = win.inner_size() != z;
+            if off || wrong_size {
+                eprintln!("main display changed: refitting pond to {}x{} at {},{}", z.width, z.height, p.x, p.y);
+                win.set_outer_position(p);
+                let _ = win.request_inner_size(z);
+                self.plat.set_scale(mon.scale_factor());
+                self.next_scan = Instant::now() + Duration::from_millis(500);
+            }
+        }
+        let primary_id = primary.as_ref().map(id_of);
         let want_any = self.settings.all_displays
             && !self.paused
             && snapshot_path().is_none()
             && self.window.is_some();
-        let main_pos = self
-            .window
-            .as_ref()
-            .and_then(|w| w.outer_position().ok())
-            .map(|p| (p.x, p.y));
         let wanted: Vec<(String, winit::monitor::MonitorHandle)> = if want_any {
             el.available_monitors()
-                .filter(|m| Some((m.position().x, m.position().y)) != main_pos)
-                .map(|m| {
-                    let (p, z) = (m.position(), m.size());
-                    (format!("{}_{}_{}x{}", p.x, p.y, z.width, z.height), m)
-                })
+                .map(|m| (id_of(&m), m))
+                .filter(|(id, _)| Some(id) != primary_id.as_ref())
                 .collect()
         } else {
             vec![]
@@ -817,99 +688,14 @@ impl App {
                 changed = true;
             }
         }
-        if changed {
-            // which edges lead where
-            let rects = self.pond_rects();
-            for i in 0..rects.len() {
-                let n = [0u8, 1, 2, 3].map(|e| {
-                    rects
-                        .iter()
-                        .enumerate()
-                        .any(|(j, r)| j != i && touching(rects[i].0, r.0, e))
-                });
-                if let Some(s) = self.pond_scene(i) {
-                    s.neighbors = n;
-                }
-            }
-        }
+        let _ = changed;
         self.top_up_visitors();
     }
 
     /// `visitors` per extra display, as little families (a grown-up leading
     /// a few ducklings). Visitors whose display has gone are dropped.
     #[cfg(not(windows))]
-    fn top_up_visitors(&mut self) {
-        let per = self.settings.visitors.min(20) as usize;
-        let ids: Vec<String> = self.extras.iter().map(|e| e.id.clone()).collect();
-        let rects = self.pond_rects();
-        for i in 0..rects.len() {
-            if let Some(s) = self.pond_scene(i) {
-                let stale: Vec<String> = s
-                    .ducks
-                    .iter()
-                    .filter(|d| {
-                        scene::is_visitor(&d.key)
-                            && !ids.iter().any(|id| id == visitor_origin(&d.key))
-                    })
-                    .map(|d| d.key.clone())
-                    .collect();
-                for k in stale {
-                    s.remove_duck(&k);
-                }
-            }
-        }
-        for (ei, id) in ids.iter().enumerate() {
-            let mut have = 0;
-            for i in 0..rects.len() {
-                if let Some(s) = self.pond_scene(i) {
-                    have += s
-                        .ducks
-                        .iter()
-                        .filter(|d| visitor_origin(&d.key) == id)
-                        .count();
-                }
-            }
-            if have > per {
-                for i in 0..rects.len() {
-                    let id = id.clone();
-                    if let Some(s) = self.pond_scene(i) {
-                        let keys: Vec<String> = s
-                            .ducks
-                            .iter()
-                            .filter(|d| visitor_origin(&d.key) == id)
-                            .map(|d| d.key.clone())
-                            .collect();
-                        for k in keys {
-                            s.remove_duck(&k);
-                        }
-                    }
-                }
-                have = 0;
-            }
-            for k in have..per {
-                self.visitor_serial += 1;
-                let key = format!("visitor:{id}#{}", self.visitor_serial);
-                // every fourth is a grown-up, the rest are its ducklings
-                let baby = k % 4 != 0;
-                let h = scene::hash(&key);
-                let breed = self.settings.breed_for(items::Kind::Other, &key, h);
-                let e = &mut self.extras[ei];
-                let (w, hh) = (e.scene.w as f32, e.scene.h as f32);
-                let mut rng = scene::Rng::new(h);
-                let home = (rng.range(30.0, w - 30.0), rng.range(40.0, hh - 20.0));
-                e.scene.add_duck(
-                    key,
-                    "Visiting duck".into(),
-                    items::Kind::Other,
-                    baby,
-                    breed,
-                    None,
-                    home,
-                    rng.range(0.0, 1.5),
-                );
-            }
-        }
-    }
+
 
     #[cfg(not(windows))]
     fn create_extra(
@@ -963,15 +749,11 @@ impl App {
         scene.show_hats = self.settings.show_hats;
         scene.set_hour(self.hour);
         window.set_visible(true);
-        let p = mon.position();
-        let z = mon.size();
         Some(Extra {
             id,
             window,
             pixels,
             scene,
-            factor,
-            rect: (p.x, p.y, z.width, z.height),
             cursor: (0.0, 0.0),
             last_click: None,
         })
@@ -1012,7 +794,11 @@ impl App {
                     && (p.0 - at.0).hypot(p.1 - at.1) < 8.0);
                 if double {
                     e.last_click = None;
-                    self.home_requested = true;
+                    // double-click a visitor: it says hello; the water: everyone home
+                    match e.scene.hit(at.0, at.1) {
+                        Some(i) => e.scene.say_visiting(i),
+                        None => self.home_requested = true,
+                    }
                 } else {
                     match e.scene.hit(at.0, at.1) {
                         Some(i) => e.scene.wake_and_quack(i),
@@ -1340,6 +1126,48 @@ const LOCK_ADDR: &str = "127.0.0.1:47817";
 
 /// `DuckPond --quit`: ask a running pond to close (it restores the icons).
 impl App {
+    /// Double-click / "Send Ducks Home": every pond's ducks go back to
+    /// their spots (visitors to theirs, on their own display).
+    fn send_everyone_home(&mut self) {
+        if let Some(s) = &mut self.scene {
+            s.send_all_home();
+        }
+        #[cfg(not(windows))]
+        for e in &mut self.extras {
+            e.scene.send_all_home();
+        }
+    }
+
+    /// One visiting family per extra display: a grown-up and its ducklings.
+    #[cfg(not(windows))]
+    fn top_up_visitors(&mut self) {
+        let per = self.settings.visitors.min(16) as usize;
+        for ei in 0..self.extras.len() {
+            let have = self.extras[ei].scene.ducks.len();
+            if have > per {
+                let keys: Vec<String> = self.extras[ei].scene.ducks.iter().map(|d| d.key.clone()).collect();
+                for k in keys {
+                    self.extras[ei].scene.remove_duck(&k);
+                }
+            }
+            let have = self.extras[ei].scene.ducks.len();
+            for k in have..per {
+                self.visitor_serial += 1;
+                let key = format!("visitor:{}#{}", self.extras[ei].id, self.visitor_serial);
+                let h = scene::hash(&key);
+                let breed = self.settings.breed_for(items::Kind::Other, &key, h);
+                let e = &mut self.extras[ei];
+                let (w, hh) = (e.scene.w as f32, e.scene.h as f32);
+                let mut rng = scene::Rng::new(h);
+                // the family settles together around the middle of the screen
+                let home = (w * 0.5 + rng.range(-w * 0.2, w * 0.2), hh * 0.55 + rng.range(-hh * 0.15, hh * 0.15));
+                // first one is the grown-up, the rest are its ducklings
+                let baby = k != 0;
+                e.scene.add_duck(key, "Visiting duck".into(), items::Kind::Other, baby, breed, None, home, rng.range(0.0, 1.5));
+            }
+        }
+    }
+
     fn window_event_body(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         #[cfg(not(windows))]
         if self.window.as_ref().map(|w| w.id()) != Some(id) {
@@ -1661,7 +1489,6 @@ impl App {
                 if let Some(s) = &mut self.scene {
                     s.sounds.extend(extra_sounds);
                 }
-                self.route_departures();
             }
             self.play_sounds();
             if !self.occluded {
