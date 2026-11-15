@@ -55,6 +55,8 @@ struct Prefs: Codable, Equatable {
     ]
     var duckling_share = 0.8
     var files: [String: FilePref] = [:]
+    var all_displays = true
+    var visitors = 5
 
     init() {}
 
@@ -73,6 +75,8 @@ struct Prefs: Codable, Equatable {
         kind_hats = try c.decodeIfPresent([String: String].self, forKey: .kind_hats) ?? def.kind_hats
         duckling_share = try c.decodeIfPresent(Double.self, forKey: .duckling_share) ?? def.duckling_share
         files = try c.decodeIfPresent([String: FilePref].self, forKey: .files) ?? def.files
+        all_displays = try c.decodeIfPresent(Bool.self, forKey: .all_displays) ?? def.all_displays
+        visitors = try c.decodeIfPresent(Int.self, forKey: .visitors) ?? def.visitors
     }
 }
 
@@ -332,6 +336,24 @@ struct GeneralPane: View {
                     Text("Always show name tags")
                     Text("Otherwise hover a duck, or hold ⌥ to see every name.")
                 }
+            }
+            Section {
+                Toggle(isOn: $store.prefs.all_displays) {
+                    Text("Pond on every display")
+                    Text("Your file ducks stay on the main display; visiting ducks roam between screens.")
+                }
+                Stepper(value: $store.prefs.visitors, in: 0...16) {
+                    HStack {
+                        Text("Visiting ducks per display")
+                        Spacer()
+                        Text("\(store.prefs.visitors)").foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+                .disabled(!store.prefs.all_displays)
+            } header: {
+                Text("Displays")
+            } footer: {
+                Text("Ducks walk across the edges where your displays touch, following your arrangement in System Settings › Displays. Double-click the water to send everyone home.")
             }
             Section("Sound") {
                 Toggle("Quacks and peeps", isOn: Binding(get: { !store.prefs.muted }, set: { store.prefs.muted = !$0 }))
@@ -701,17 +723,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        if let duck = Sprites(cell: [20, 18]).duck(row: 0) {
-            // a big pixel duck for the Dock
-            let big = NSImage(size: NSSize(width: 512, height: 512), flipped: false) { rect in
-                NSGraphicsContext.current?.imageInterpolation = .none
-                duck.draw(in: rect.insetBy(dx: 26, dy: 56))
-                return true
-            }
-            NSApp.applicationIconImage = big
-        }
+        // Duck Pond lives in the menu bar: no Dock icon, even while Settings is open.
+        NSApp.setActivationPolicy(.accessory)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+            NSApp.windows.first?.center()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

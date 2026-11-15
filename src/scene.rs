@@ -193,6 +193,8 @@ pub struct Scene {
     land: Vec<bool>,
     glints: Vec<(u32, f32)>,
     bg_k: u32,
+    /// which edges lead to another display: left, right, up, down
+    pub neighbors: [bool; 4],
     pub ducks: Vec<Duck>,
     crumbs: Vec<Crumb>,
     ripples: Vec<Ripple>,
@@ -254,6 +256,7 @@ impl Scene {
             land: vec![],
             glints: vec![],
             bg_k: 1,
+            neighbors: [false; 4],
             ducks: vec![],
             crumbs: vec![],
             ripples: vec![],
@@ -577,6 +580,104 @@ impl Scene {
             darts: 0,
             t: 0.0,
         });
+    }
+
+    /// A point just past an edge that leads to another display, or None.
+    fn pick_exit(&mut self, i: usize) -> Option<(f32, f32)> {
+        let open: Vec<usize> = (0..4).filter(|&e| self.neighbors[e]).collect();
+        if open.is_empty() {
+            return None;
+        }
+        let e = open[(self.rng.next() % open.len() as u64) as usize];
+        let (x, y) = (self.ducks[i].x, self.ducks[i].y);
+        let (w, h) = (self.w as f32, self.h as f32);
+        Some(match e {
+            0 => (-10.0, y),
+            1 => (w + 10.0, y),
+            2 => (x, CELL_H as f32 - 12.0),
+            _ => (x, h + 10.0),
+        })
+    }
+
+    /// Send duck i off through `edge` (0 L / 1 R / 2 U / 3 D), ducklings in tow.
+    pub fn head_out(&mut self, i: usize, edge: u8) {
+        let (x, y) = (self.ducks[i].x, self.ducks[i].y);
+        let (w, h) = (self.w as f32, self.h as f32);
+        let exit = match edge {
+            0 => (-10.0, y),
+            1 => (w + 10.0, y),
+            2 => (x, CELL_H as f32 - 12.0),
+            _ => (x, h + 10.0),
+        };
+        self.ducks[i].st = St::Home;
+        self.ducks[i].home = exit;
+        let kids: Vec<usize> = (0..self.ducks.len())
+            .filter(|&k| self.ducks[k].parent == Some(i))
+            .collect();
+        for k in kids {
+            self.ducks[k].st = St::Home;
+            self.ducks[k].home = (exit.0, exit.1 + (k % 3) as f32 - 1.0);
+        }
+    }
+
+    /// Visiting ducks that have walked off an edge: (duck, edge 0 L / 1 R / 2 U / 3 D).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn take_departures(&mut self) -> Vec<(Duck, u8)> {
+        let (w, h) = (self.w as f32, self.h as f32);
+        let edge = |d: &Duck| -> Option<u8> {
+            if !is_visitor(&d.key) || d.st == St::Held {
+                None
+            } else if d.x < -6.0 {
+                Some(0)
+            } else if d.x > w + 6.0 {
+                Some(1)
+            } else if d.y < CELL_H as f32 - 8.0 {
+                Some(2)
+            } else if d.y > h + 6.0 {
+                Some(3)
+            } else {
+                None
+            }
+        };
+        if !self.ducks.iter().any(|d| edge(d).is_some()) {
+            return vec![];
+        }
+        let mut out = vec![];
+        let mut keep = vec![];
+        for d in self.ducks.drain(..) {
+            match edge(&d) {
+                Some(e) => out.push((d, e)),
+                None => keep.push(d),
+            }
+        }
+        self.ducks = keep;
+        self.hover = None;
+        self.selected = None;
+        self.families_dirty = true;
+        out
+    }
+
+    /// A visiting duck arriving through `edge` of this pond at (x, y): it
+    /// waddles in a little way and makes itself at home.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn arrive(&mut self, mut d: Duck, edge: u8, x: f32, y: f32) {
+        let (w, h) = (self.w as f32, self.h as f32);
+        let inset = self.rng.range(14.0, 34.0);
+        let (sx, sy, tx, ty) = match edge {
+            0 => (-8.0, y, inset, y),
+            1 => (w + 8.0, y, w - inset, y),
+            2 => (x, CELL_H as f32 - 10.0, x, CELL_H as f32 + inset * 0.6),
+            _ => (x, h + 8.0, x, h - inset * 0.6),
+        };
+        let (tx, ty) = self.clamp(tx, ty);
+        d.x = sx;
+        d.y = sy.clamp(-20.0, h + 20.0);
+        d.home = (tx, ty);
+        d.st = St::Wander(tx, ty);
+        d.parent = None;
+        d.right = tx > sx;
+        self.ducks.push(d);
+        self.families_dirty = true;
     }
 
     pub fn send_all_home(&mut self) {
@@ -1228,6 +1329,22 @@ impl Scene {
                     let r = self.rng.f();
                     let wander_p = 0.55 - self.night * 0.3;
                     let sleep_p = wander_p + 0.08 + self.night * 0.35;
+                    // visiting ducks sometimes set off for the next display,
+                    // ducklings in tow
+                    if r < wander_p * 0.3 && is_visitor(&self.ducks[i].key) && !self.ducks[i].baby {
+                        if let Some(exit) = self.pick_exit(i) {
+                            self.ducks[i].st = St::Wander(exit.0, exit.1);
+                            let kids: Vec<usize> = (0..self.ducks.len())
+                                .filter(|&k| self.ducks[k].parent == Some(i))
+                                .collect();
+                            for k in kids {
+                                let d = &mut self.ducks[k];
+                                d.st = St::Wander(exit.0, exit.1 + (k % 3) as f32 - 1.0);
+                                d.stay = 0.0;
+                            }
+                            return;
+                        }
+                    }
                     if r < wander_p {
                         let a = self.rng.range(0.0, 6.283);
                         let rad = self.rng.range(4.0, ROAM);
@@ -2410,6 +2527,11 @@ fn draw_idea(frame: &mut [u8], w: i32, h: i32, x: i32, y: i32, idea: u8, a: u8) 
             }
         }
     }
+}
+
+/// Ducks that aren't desktop files: they roam between displays.
+pub fn is_visitor(key: &str) -> bool {
+    key.starts_with("visitor:")
 }
 
 #[inline]

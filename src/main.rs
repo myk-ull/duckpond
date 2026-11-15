@@ -113,6 +113,52 @@ struct App {
     next_clock: Instant,
     started: Instant,
     snap_stage: u8,
+    /// ponds on the other displays (macOS)
+    #[cfg(not(windows))]
+    extras: Vec<Extra>,
+    next_displays: Instant,
+    hour: f32,
+    /// visiting ducks on their way back to their own display
+    homing: HashSet<String>,
+    home_requested: bool,
+    #[cfg_attr(windows, allow(dead_code))]
+    visitor_serial: u32,
+}
+
+/// A pond on one of the other displays: full painting, visiting ducks only.
+#[cfg(not(windows))]
+struct Extra {
+    id: String,
+    window: Arc<Window>,
+    pixels: Pixels<'static>,
+    scene: Scene,
+    factor: u32,
+    /// monitor rectangle in physical pixels of the desktop
+    rect: (i32, i32, u32, u32),
+    cursor: (f32, f32),
+    last_click: Option<(Instant, (f32, f32))>,
+}
+
+/// Which edges of `a` touch another display: left, right, up, down.
+fn touching(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32), edge: u8) -> bool {
+    const SLACK: i32 = 48;
+    let (ax, ay, aw, ah) = (a.0, a.1, a.2 as i32, a.3 as i32);
+    let (bx, by, bw, bh) = (b.0, b.1, b.2 as i32, b.3 as i32);
+    let v_overlap = ay < by + bh && by < ay + ah;
+    let h_overlap = ax < bx + bw && bx < ax + aw;
+    match edge {
+        0 => v_overlap && (bx + bw - ax).abs() < SLACK,
+        1 => v_overlap && (ax + aw - bx).abs() < SLACK,
+        2 => h_overlap && (by + bh - ay).abs() < SLACK,
+        _ => h_overlap && (ay + ah - by).abs() < SLACK,
+    }
+}
+
+fn visitor_origin(key: &str) -> &str {
+    key.strip_prefix("visitor:")
+        .and_then(|r| r.rsplit_once('#'))
+        .map(|(o, _)| o)
+        .unwrap_or("")
 }
 
 fn save_png(path: &str, w: u32, h: u32, rgba: &[u8], k: u32) {
@@ -176,6 +222,13 @@ impl App {
             next_clock: now,
             started: now,
             snap_stage: 0,
+            #[cfg(not(windows))]
+            extras: vec![],
+            next_displays: now + Duration::from_secs(2),
+            hour: 14.0,
+            homing: HashSet::new(),
+            home_requested: false,
+            visitor_serial: 0,
         }
     }
 
@@ -311,7 +364,9 @@ impl App {
         let mut rng = scene::Rng::new(items.len() as u64 + 3);
         let mut dirty = !removed.is_empty();
         for it in added {
-            let phys = it.pos.or_else(|| self.settings.state.homes.get(&it.key).copied());
+            let phys = it
+                .pos
+                .or_else(|| self.settings.state.homes.get(&it.key).copied());
             let home = match phys {
                 Some((x, y)) => ((x / f) as f32, (y / f) as f32),
                 None => {
@@ -325,7 +380,10 @@ impl App {
                 }
             };
             if it.pos.is_some() && !self.settings.state.homes.contains_key(&it.key) {
-                self.settings.state.homes.insert(it.key.clone(), it.pos.unwrap());
+                self.settings
+                    .state
+                    .homes
+                    .insert(it.key.clone(), it.pos.unwrap());
                 dirty = true;
             }
             let delay = if entrance { rng.range(0.0, 1.8) } else { 0.0 };
@@ -356,7 +414,7 @@ impl App {
         if had_new {
             scene.relax_homes();
             // remember the de-overlapped spots so they survive restarts
-            for d in &scene.ducks {
+            for d in scene.ducks.iter().filter(|d| !scene::is_visitor(&d.key)) {
                 self.settings
                     .state
                     .homes
@@ -383,11 +441,7 @@ impl App {
         match o {
             Outcome::None => {}
             Outcome::Rescan => self.next_scan = Instant::now() + Duration::from_millis(400),
-            Outcome::SendHome => {
-                if let Some(s) = &mut self.scene {
-                    s.send_all_home()
-                }
-            }
+            Outcome::SendHome => self.home_requested = true,
             Outcome::FeedAll => {
                 if let Some(s) = &mut self.scene {
                     s.feed_everyone()
@@ -436,8 +490,11 @@ impl App {
         if let Some(scene) = &mut self.scene {
             let adults = self.settings.adult_keys(&self.last_items);
             for d in scene.ducks.iter_mut() {
-                let h = scene::hash(&d.name);
+                let h = scene::hash(&d.key);
                 d.breed = self.settings.breed_for(d.kind, &d.key, h);
+                if scene::is_visitor(&d.key) {
+                    continue; // visitors keep their own age and go bare-headed
+                }
                 d.hat = self.settings.hat_for(d.kind, &d.key, h);
                 d.baby = !adults.contains(&d.key);
             }
@@ -447,6 +504,14 @@ impl App {
             catalog::write_items(&scene.ducks);
         }
         self.next_clock = Instant::now();
+        self.next_displays = Instant::now();
+        #[cfg(not(windows))]
+        for e in &mut self.extras {
+            e.scene.show_hats = self.settings.show_hats;
+            for d in e.scene.ducks.iter_mut() {
+                d.breed = self.settings.breed_for(d.kind, &d.key, scene::hash(&d.key));
+            }
+        }
         if !demo() && !dev_build() && autostart::is_enabled() != self.settings.open_at_login {
             autostart::set(self.settings.open_at_login);
         }
@@ -510,12 +575,7 @@ impl App {
             None,
         ));
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(
-            "tray:prefs",
-            "Settings…",
-            true,
-            None,
-        ));
+        let _ = menu.append(&MenuItem::with_id("tray:prefs", "Settings…", true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&labels);
         let _ = menu.append(&hats);
@@ -580,11 +640,415 @@ impl App {
         }
     }
 
+    /// Every pond's rectangle (physical desktop pixels) and art scale.
+    /// Index 0 is the main pond.
+    fn pond_rects(&self) -> Vec<((i32, i32, u32, u32), u32, String)> {
+        let mut v = vec![];
+        if let Some(w) = &self.window {
+            let p = w.outer_position().map(|p| (p.x, p.y)).unwrap_or((0, 0));
+            let s = w.inner_size();
+            v.push((
+                (p.0, p.1, s.width, s.height),
+                self.factor,
+                "main".to_string(),
+            ));
+        }
+        #[cfg(not(windows))]
+        for e in &self.extras {
+            v.push((e.rect, e.factor, e.id.clone()));
+        }
+        v
+    }
+
+    fn pond_scene(&mut self, i: usize) -> Option<&mut Scene> {
+        if i == 0 {
+            return self.scene.as_mut();
+        }
+        #[cfg(not(windows))]
+        {
+            return self.extras.get_mut(i - 1).map(|e| &mut e.scene);
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    /// Double-click / "Send Ducks Home": file ducks return to their icons;
+    /// visiting ducks head back to the display they came from.
+    fn send_everyone_home(&mut self) {
+        let rects = self.pond_rects();
+        for i in 0..rects.len() {
+            if let Some(s) = self.pond_scene(i) {
+                s.send_all_home();
+            }
+        }
+        self.homing.clear();
+        for i in 0..rects.len() {
+            let here = rects[i].2.clone();
+            let keys: Vec<String> = match self.pond_scene(i) {
+                Some(s) => s
+                    .ducks
+                    .iter()
+                    .filter(|d| scene::is_visitor(&d.key) && visitor_origin(&d.key) != here)
+                    .map(|d| d.key.clone())
+                    .collect(),
+                None => vec![],
+            };
+            for k in keys {
+                self.homing.insert(k.clone());
+                self.steer_home(i, &k, &rects);
+            }
+        }
+    }
+
+    /// Point a visiting duck in pond `i` at the edge that leads towards its
+    /// own display (one hop at a time, along the real display layout).
+    fn steer_home(&mut self, i: usize, key: &str, rects: &[((i32, i32, u32, u32), u32, String)]) {
+        let origin = visitor_origin(key).to_string();
+        let Some(target) = rects.iter().find(|r| r.2 == origin).map(|r| r.0) else {
+            self.homing.remove(key);
+            return;
+        };
+        let here = rects[i].0;
+        let (cx, cy) = (here.0 + here.2 as i32 / 2, here.1 + here.3 as i32 / 2);
+        let (tx, ty) = (
+            target.0 + target.2 as i32 / 2,
+            target.1 + target.3 as i32 / 2,
+        );
+        let (dx, dy) = (tx - cx, ty - cy);
+        // try the main direction first, then the other axis
+        let mut order: Vec<u8> = if dx.abs() >= dy.abs() {
+            vec![if dx < 0 { 0 } else { 1 }, if dy < 0 { 2 } else { 3 }]
+        } else {
+            vec![if dy < 0 { 2 } else { 3 }, if dx < 0 { 0 } else { 1 }]
+        };
+        order.extend([0, 1, 2, 3]);
+        let edge = order.into_iter().find(|&e| {
+            rects
+                .iter()
+                .enumerate()
+                .any(|(j, r)| j != i && touching(here, r.0, e))
+        });
+        if let (Some(edge), Some(s)) = (edge, self.pond_scene(i)) {
+            if let Some(di) = s.find(key) {
+                s.head_out(di, edge);
+            }
+        }
+    }
+
+    /// Hand visiting ducks that walked off one display to the display next door.
+    #[cfg(not(windows))]
+    fn route_departures(&mut self) {
+        let rects = self.pond_rects();
+        let mut moving = vec![];
+        for i in 0..rects.len() {
+            if let Some(s) = self.pond_scene(i) {
+                for (d, edge) in s.take_departures() {
+                    let ((rx, ry, _, _), f, _) = rects[i];
+                    let (gx, gy) = (rx as f32 + d.x * f as f32, ry as f32 + d.y * f as f32);
+                    moving.push((i, d, edge, gx, gy));
+                }
+            }
+        }
+        for (from, d, edge, gx, gy) in moving {
+            let key = d.key.clone();
+            // the display touching that edge (closest along the crossing)
+            let to = (0..rects.len())
+                .filter(|&j| j != from && touching(rects[from].0, rects[j].0, edge))
+                .min_by_key(|&j| {
+                    let r = rects[j].0;
+                    let (cx, cy) = (r.0 + r.2 as i32 / 2, r.1 + r.3 as i32 / 2);
+                    ((cx as f32 - gx).abs() + (cy as f32 - gy).abs()) as i64
+                });
+            let (j, in_edge) = match to {
+                Some(j) => (j, [1u8, 0, 3, 2][edge as usize]),
+                None => (from, edge), // nowhere to go: turn back
+            };
+            let ((rx, ry, _, _), f, ref name) = rects[j];
+            let arrived_home = name == visitor_origin(&key);
+            if let Some(s) = self.pond_scene(j) {
+                let (ax, ay) = ((gx - rx as f32) / f as f32, (gy - ry as f32) / f as f32);
+                let (w, h) = (s.w as f32, s.h as f32);
+                s.arrive(d, in_edge, ax.clamp(4.0, w - 4.0), ay.clamp(20.0, h - 4.0));
+            }
+            if self.homing.contains(&key) {
+                if arrived_home {
+                    self.homing.remove(&key);
+                } else {
+                    self.steer_home(j, &key, &rects);
+                }
+            }
+        }
+    }
+
+    /// One pond per extra display; add/remove as displays come and go, and
+    /// keep the right number of visiting ducks.
+    #[cfg(not(windows))]
+    fn sync_displays(&mut self, el: &ActiveEventLoop) {
+        let want_any = self.settings.all_displays
+            && !self.paused
+            && snapshot_path().is_none()
+            && self.window.is_some();
+        let main_pos = self
+            .window
+            .as_ref()
+            .and_then(|w| w.outer_position().ok())
+            .map(|p| (p.x, p.y));
+        let wanted: Vec<(String, winit::monitor::MonitorHandle)> = if want_any {
+            el.available_monitors()
+                .filter(|m| Some((m.position().x, m.position().y)) != main_pos)
+                .map(|m| {
+                    let (p, z) = (m.position(), m.size());
+                    (format!("{}_{}_{}x{}", p.x, p.y, z.width, z.height), m)
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let before = self.extras.len();
+        self.extras
+            .retain(|e| wanted.iter().any(|(id, _)| *id == e.id));
+        let mut changed = self.extras.len() != before;
+        for (id, mon) in wanted {
+            if self.extras.iter().any(|e| e.id == id) {
+                continue;
+            }
+            if let Some(e) = self.create_extra(el, id, &mon) {
+                self.extras.push(e);
+                changed = true;
+            }
+        }
+        if changed {
+            // which edges lead where
+            let rects = self.pond_rects();
+            for i in 0..rects.len() {
+                let n = [0u8, 1, 2, 3].map(|e| {
+                    rects
+                        .iter()
+                        .enumerate()
+                        .any(|(j, r)| j != i && touching(rects[i].0, r.0, e))
+                });
+                if let Some(s) = self.pond_scene(i) {
+                    s.neighbors = n;
+                }
+            }
+        }
+        self.top_up_visitors();
+    }
+
+    /// `visitors` per extra display, as little families (a grown-up leading
+    /// a few ducklings). Visitors whose display has gone are dropped.
+    #[cfg(not(windows))]
+    fn top_up_visitors(&mut self) {
+        let per = self.settings.visitors.min(20) as usize;
+        let ids: Vec<String> = self.extras.iter().map(|e| e.id.clone()).collect();
+        let rects = self.pond_rects();
+        for i in 0..rects.len() {
+            if let Some(s) = self.pond_scene(i) {
+                let stale: Vec<String> = s
+                    .ducks
+                    .iter()
+                    .filter(|d| {
+                        scene::is_visitor(&d.key)
+                            && !ids.iter().any(|id| id == visitor_origin(&d.key))
+                    })
+                    .map(|d| d.key.clone())
+                    .collect();
+                for k in stale {
+                    s.remove_duck(&k);
+                }
+            }
+        }
+        for (ei, id) in ids.iter().enumerate() {
+            let mut have = 0;
+            for i in 0..rects.len() {
+                if let Some(s) = self.pond_scene(i) {
+                    have += s
+                        .ducks
+                        .iter()
+                        .filter(|d| visitor_origin(&d.key) == id)
+                        .count();
+                }
+            }
+            if have > per {
+                for i in 0..rects.len() {
+                    let id = id.clone();
+                    if let Some(s) = self.pond_scene(i) {
+                        let keys: Vec<String> = s
+                            .ducks
+                            .iter()
+                            .filter(|d| visitor_origin(&d.key) == id)
+                            .map(|d| d.key.clone())
+                            .collect();
+                        for k in keys {
+                            s.remove_duck(&k);
+                        }
+                    }
+                }
+                have = 0;
+            }
+            for k in have..per {
+                self.visitor_serial += 1;
+                let key = format!("visitor:{id}#{}", self.visitor_serial);
+                // every fourth is a grown-up, the rest are its ducklings
+                let baby = k % 4 != 0;
+                let h = scene::hash(&key);
+                let breed = self.settings.breed_for(items::Kind::Other, &key, h);
+                let e = &mut self.extras[ei];
+                let (w, hh) = (e.scene.w as f32, e.scene.h as f32);
+                let mut rng = scene::Rng::new(h);
+                let home = (rng.range(30.0, w - 30.0), rng.range(40.0, hh - 20.0));
+                e.scene.add_duck(
+                    key,
+                    "Visiting duck".into(),
+                    items::Kind::Other,
+                    baby,
+                    breed,
+                    None,
+                    home,
+                    rng.range(0.0, 1.5),
+                );
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn create_extra(
+        &mut self,
+        el: &ActiveEventLoop,
+        id: String,
+        mon: &winit::monitor::MonitorHandle,
+    ) -> Option<Extra> {
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes()
+            .with_title("Duck Pond")
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_visible(false)
+            .with_position(mon.position())
+            .with_inner_size(mon.size());
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs.with_has_shadow(false).with_accepts_first_mouse(true);
+        }
+        let window = Arc::new(el.create_window(attrs).ok()?);
+        self.plat.prepare_window(&window);
+        let size = window.inner_size();
+        let factor = ((size.width as f64 / ART_WIDTH).round() as u32).max(1);
+        let (aw, ah) = ((size.width / factor).max(1), (size.height / factor).max(1));
+        let st = SurfaceTexture::new(size.width, size.height, window.clone());
+        let pixels = PixelsBuilder::new(aw, ah, st)
+            .request_adapter_options(wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })
+            .clear_color(wgpu::Color {
+                r: 0.33,
+                g: 0.47,
+                b: 0.68,
+                a: 1.0,
+            })
+            .build()
+            .ok()?;
+        let mut scene = Scene::new(
+            aw,
+            ah,
+            &self.pond,
+            &self.land,
+            Img::decode(DUCKS_PNG),
+            Img::decode(HATS_PNG),
+        );
+        scene.hires_tags = true; // visitors have no name tags
+        scene.show_hats = self.settings.show_hats;
+        scene.set_hour(self.hour);
+        window.set_visible(true);
+        let p = mon.position();
+        let z = mon.size();
+        Some(Extra {
+            id,
+            window,
+            pixels,
+            scene,
+            factor,
+            rect: (p.x, p.y, z.width, z.height),
+            cursor: (0.0, 0.0),
+            last_click: None,
+        })
+    }
+
+    /// Input and drawing for the ponds on other displays.
+    #[cfg(not(windows))]
+    fn extra_event(&mut self, id: WindowId, event: WindowEvent) {
+        let Some(ix) = self.extras.iter().position(|e| e.window.id() == id) else {
+            return;
+        };
+        match event {
+            WindowEvent::RedrawRequested => {
+                let e = &mut self.extras[ix];
+                e.scene.render(e.pixels.frame_mut());
+                if let Err(err) = e.pixels.render() {
+                    eprintln!("render (extra display): {err}");
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let e = &mut self.extras[ix];
+                let (x, y) = e
+                    .pixels
+                    .window_pos_to_pixel((position.x as f32, position.y as f32))
+                    .unwrap_or_else(|p| e.pixels.clamp_pixel_pos(p));
+                e.cursor = (x as f32 + 0.5, y as f32 + 0.5);
+                e.scene.hover = e.scene.hit(e.cursor.0, e.cursor.1);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let now = Instant::now();
+                let e = &mut self.extras[ix];
+                let at = e.cursor;
+                let double = matches!(e.last_click, Some((t, p)) if now.duration_since(t) < DOUBLE_CLICK
+                    && (p.0 - at.0).hypot(p.1 - at.1) < 8.0);
+                if double {
+                    e.last_click = None;
+                    self.home_requested = true;
+                } else {
+                    match e.scene.hit(at.0, at.1) {
+                        Some(i) => e.scene.wake_and_quack(i),
+                        None => e.scene.drop_food(at.0, at.1),
+                    }
+                    e.last_click = Some((now, at));
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let w = self.extras[ix].window.clone();
+                let labels = self.settings.show_labels;
+                let o = self.plat.show_desktop_menu(&w, labels);
+                self.apply(o);
+            }
+            WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
+                let _ = self.extras[ix]
+                    .pixels
+                    .resize_surface(size.width, size.height);
+            }
+            WindowEvent::Destroyed => {
+                self.extras.remove(ix);
+            }
+            _ => {}
+        }
+    }
+
     fn set_paused(&mut self, paused: bool) {
         if paused == self.paused {
             return;
         }
         self.paused = paused;
+        self.next_displays = Instant::now();
         if let Some(c) = &self.tray_pause {
             c.set_checked(paused);
         }
@@ -634,7 +1098,10 @@ impl App {
                     let n = quacks::QUACKS.len();
                     // each duck leans towards its own voice, with some wobble
                     let i = (v as usize * 4 + r % 5) % n;
-                    self.plat.play(quacks::QUACKS[i], self.settings.volume.clamp(0.0, 1.0) * 0.85);
+                    self.plat.play(
+                        quacks::QUACKS[i],
+                        self.settings.volume.clamp(0.0, 1.0) * 0.85,
+                    );
                 }
                 Sound::Peep => self.plat.play(
                     quacks::PEEPS[r % quacks::PEEPS.len()],
@@ -710,6 +1177,9 @@ impl App {
                         if let Some((x, y)) = scene.release(i) {
                             let f = self.factor as f64;
                             let key = scene.ducks[i].key.clone();
+                            if scene::is_visitor(&key) {
+                                return;
+                            }
                             self.settings
                                 .state
                                 .homes
@@ -727,7 +1197,9 @@ impl App {
                     Some(i) => {
                         if double(Target::Duck(i), &self.last_click) {
                             let key = scene.ducks[i].key.clone();
-                            self.plat.open(&key);
+                            if !scene::is_visitor(&key) {
+                                self.plat.open(&key);
+                            }
                             self.last_click = None;
                         } else {
                             scene.selected = Some(i);
@@ -738,7 +1210,7 @@ impl App {
                     None => {
                         if double(Target::Empty, &self.last_click) {
                             self.pending_food = None;
-                            scene.send_all_home();
+                            self.home_requested = true;
                             self.last_click = None;
                         } else {
                             scene.selected = None;
@@ -750,7 +1222,10 @@ impl App {
             }
             (MouseButton::Right, ElementState::Pressed) => {
                 self.press = None;
-                let outcome = match scene.hit(at.0, at.1) {
+                let hit = scene
+                    .hit(at.0, at.1)
+                    .filter(|&i| !scene::is_visitor(&scene.ducks[i].key));
+                let outcome = match hit {
                     Some(i) => {
                         scene.selected = Some(i);
                         let key = scene.ducks[i].key.clone();
@@ -773,7 +1248,7 @@ impl App {
         } else {
             self.mods.control_key()
         };
-        let Some(sel) = self.selected_key() else {
+        let Some(sel) = self.selected_key().filter(|k| !scene::is_visitor(k)) else {
             return;
         };
         match key {
@@ -831,7 +1306,13 @@ impl ApplicationHandler for App {
         self.last = Instant::now();
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(not(windows))]
+        if self.window.as_ref().map(|w| w.id()) != Some(id) {
+            self.extra_event(id, event);
+            return;
+        }
+        let _ = id;
         match event {
             WindowEvent::CloseRequested => {
                 self.exiting = true;
@@ -1092,9 +1573,22 @@ impl ApplicationHandler for App {
                 });
             // day & night off: always a soft afternoon
             let hour = if self.settings.day_night { hour } else { 14.0 };
+            self.hour = hour;
             if let Some(s) = &mut self.scene {
                 s.set_hour(hour);
             }
+            #[cfg(not(windows))]
+            for e in &mut self.extras {
+                e.scene.set_hour(hour);
+            }
+        }
+        if now >= self.next_displays {
+            self.next_displays = now + Duration::from_secs(3);
+            #[cfg(not(windows))]
+            self.sync_displays(el);
+        }
+        if std::mem::take(&mut self.home_requested) {
+            self.send_everyone_home();
         }
         if now >= self.next_prefs_check {
             self.next_prefs_check = now + Duration::from_millis(700);
@@ -1120,14 +1614,34 @@ impl ApplicationHandler for App {
             if let Some(s) = &mut self.scene {
                 s.update(dt);
             }
+            #[cfg(not(windows))]
+            {
+                let mut extra_sounds = vec![];
+                for e in &mut self.extras {
+                    e.scene.update(dt);
+                    extra_sounds.extend(e.scene.sounds.drain(..));
+                    if !self.occluded {
+                        e.window.request_redraw();
+                    }
+                }
+                if let Some(s) = &mut self.scene {
+                    s.sounds.extend(extra_sounds);
+                }
+                self.route_departures();
+            }
             self.play_sounds();
             if !self.occluded {
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
-            let busy =
-                self.scene.as_ref().map(|s| s.busy()).unwrap_or(false) || self.press.is_some();
+            #[cfg(not(windows))]
+            let extras_busy = self.extras.iter().any(|e| e.scene.busy());
+            #[cfg(windows)]
+            let extras_busy = false;
+            let busy = self.scene.as_ref().map(|s| s.busy()).unwrap_or(false)
+                || self.press.is_some()
+                || extras_busy;
             let fps = if self.occluded {
                 2.0
             } else if busy {

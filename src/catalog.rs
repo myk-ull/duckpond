@@ -56,7 +56,10 @@ pub fn write_static(ducks_png: &[u8], hats_png: &[u8]) {
         .enumerate()
         .map(|(i, h)| json!({ "id": h.name, "name": hat_label(h.name), "x": i as u32 * HAT_CELL_W, "w": h.w, "h": h.h }))
         .collect();
-    let kinds: Vec<_> = Kind::ALL.iter().map(|k| json!({ "id": k.key(), "name": k.label() })).collect();
+    let kinds: Vec<_> = Kind::ALL
+        .iter()
+        .map(|k| json!({ "id": k.key(), "name": k.label() }))
+        .collect();
     let cat = json!({
         "version": 1,
         "cell": [CELL_W, CELL_H],
@@ -73,6 +76,7 @@ pub fn write_static(ducks_png: &[u8], hats_png: &[u8]) {
 pub fn write_items(ducks: &[Duck]) {
     let mut rows: Vec<_> = ducks
         .iter()
+        .filter(|d| !crate::scene::is_visitor(&d.key))
         .map(|d| {
             json!({
                 "key": d.key,
@@ -85,7 +89,11 @@ pub fn write_items(ducks: &[Duck]) {
         })
         .collect();
     rows.sort_by(|a, b| {
-        a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
     });
     if let Ok(b) = serde_json::to_vec(&json!({ "items": rows })) {
         write(dir().join("items.json"), &b);

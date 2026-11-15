@@ -36,6 +36,11 @@ On macOS it's a native window in the style of System Settings:
 - **Your Files**: search any file on your desktop and set its exact breed,
   age (duckling / grown-up) and hat.
 
+With several displays, every display gets the pond. Your file ducks stay on
+the main display; a few visiting ducks live on the others and waddle across
+wherever your displays touch (following System Settings › Displays).
+Double-clicking the water sends everyone home, visitors included.
+
 Every change applies to the pond immediately. Ten breeds are included; white
 Pekins and yellow ducks are the default.
 

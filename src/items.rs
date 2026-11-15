@@ -225,6 +225,16 @@ pub struct Prefs {
     /// per-file overrides, keyed by item key (path)
     #[serde(default)]
     pub files: HashMap<String, FilePref>,
+    /// a pond on every display, not just the main one
+    #[serde(default = "yes")]
+    pub all_displays: bool,
+    /// visiting ducks (not tied to files) on each extra display
+    #[serde(default = "default_visitors")]
+    pub visitors: u32,
+}
+
+fn default_visitors() -> u32 {
+    5
 }
 
 const PREFS_VERSION: u32 = 3;
@@ -244,6 +254,8 @@ impl Default for Prefs {
             kind_hats: default_kind_hats(),
             duckling_share: default_share(),
             files: HashMap::new(),
+            all_displays: true,
+            visitors: default_visitors(),
         }
     }
 }
@@ -270,7 +282,11 @@ impl Prefs {
                 return i;
             }
         }
-        let choice = self.kind_breeds.get(kind.key()).map(|s| s.as_str()).unwrap_or(MIX);
+        let choice = self
+            .kind_breeds
+            .get(kind.key())
+            .map(|s| s.as_str())
+            .unwrap_or(MIX);
         if choice != MIX {
             if let Some(i) = idx(choice) {
                 return i;
@@ -289,9 +305,17 @@ impl Prefs {
         let pick = match self.file(key).and_then(|f| f.hat.as_deref()) {
             Some(h) if h != AUTO => h.to_string(),
             _ => {
-                let h = self.kind_hats.get(kind.key()).cloned().unwrap_or_else(|| NO_HAT.into());
+                let h = self
+                    .kind_hats
+                    .get(kind.key())
+                    .cloned()
+                    .unwrap_or_else(|| NO_HAT.into());
                 // screenshots: every third beret is navy, for variety
-                if h == "beret" && hash % 3 == 0 { "beret_navy".into() } else { h }
+                if h == "beret" && hash % 3 == 0 {
+                    "beret_navy".into()
+                } else {
+                    h
+                }
             }
         };
         hats.iter().position(|h| h.name == pick)
@@ -304,9 +328,16 @@ impl Prefs {
         use std::collections::HashSet;
         let share = self.duckling_share.clamp(0.0, 0.95) as f64;
         let target = ((items.len() as f64) * (1.0 - share)).ceil() as usize;
-        let age = |i: &Item| self.file(&i.key).and_then(|f| f.age.as_deref()).filter(|a| *a != AUTO);
-        let mut adults: HashSet<String> =
-            items.iter().filter(|i| age(i) == Some("adult")).map(|i| i.key.clone()).collect();
+        let age = |i: &Item| {
+            self.file(&i.key)
+                .and_then(|f| f.age.as_deref())
+                .filter(|a| *a != AUTO)
+        };
+        let mut adults: HashSet<String> = items
+            .iter()
+            .filter(|i| age(i) == Some("adult"))
+            .map(|i| i.key.clone())
+            .collect();
         let free: Vec<&Item> = items.iter().filter(|i| age(i).is_none()).collect();
         for i in free.iter().filter(|i| i.is_dir || i.kind == Kind::App) {
             if adults.len() >= target.max(1) {
@@ -376,9 +407,17 @@ impl Settings {
 
     pub fn load() -> Settings {
         let pp = Self::prefs_path();
-        let read = |p: &std::path::Path| std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-        let mut prefs: Prefs = read(&pp).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-        let mut state: State = read(&Self::state_path()).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        let read = |p: &std::path::Path| {
+            std::fs::read(p)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        };
+        let mut prefs: Prefs = read(&pp)
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let mut state: State = read(&Self::state_path())
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
         let mut migrated = false;
         // older builds kept everything in settings.json
         if !pp.exists() {
@@ -398,10 +437,16 @@ impl Settings {
                     }
                 }
                 if old.get("version").and_then(|v| v.as_u64()).unwrap_or(0) >= 2 {
-                    if let Some(m) = old.get("mix").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+                    if let Some(m) = old
+                        .get("mix")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    {
                         prefs.mix = m;
                     }
-                    if let Some(m) = old.get("kind_breeds").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+                    if let Some(m) = old
+                        .get("kind_breeds")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    {
                         prefs.kind_breeds = m;
                     }
                 }
@@ -412,7 +457,11 @@ impl Settings {
             prefs.version = PREFS_VERSION;
             migrated = true;
         }
-        let mut s = Settings { prefs, state, prefs_stamp: None };
+        let mut s = Settings {
+            prefs,
+            state,
+            prefs_stamp: None,
+        };
         if migrated {
             s.save();
         }
@@ -447,7 +496,10 @@ impl Settings {
             return false;
         }
         self.prefs_stamp = now;
-        let Some(new) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Prefs>(&b).ok()) else {
+        let Some(new) = std::fs::read(&p)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Prefs>(&b).ok())
+        else {
             return false;
         };
         if new == self.prefs {
