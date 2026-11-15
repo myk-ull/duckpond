@@ -1,0 +1,48 @@
+# Builds Duck Pond on a real Windows machine, runs the self-test (desktop
+# listing via Explorer, icon positions, simulation + drawing), and keeps the
+# report, the rendered picture and the installer as downloadable artifacts.
+name: windows
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-and-selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Put a few things on the desktop to turn into ducks
+        shell: pwsh
+        run: |
+          $d = [Environment]::GetFolderPath('Desktop')
+          New-Item -ItemType Directory -Force "$d\ci folder" | Out-Null
+          Set-Content "$d\notes.md" "quack"
+          Set-Content "$d\report.pdf" "not really a pdf"
+
+      - name: Build (MSVC)
+        run: cargo build --release
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          .\target\release\duckpond.exe --selftest
+          Get-Content "$env:TEMP\duckpond-selftest.txt"
+          Copy-Item "$env:TEMP\duckpond-selftest.*" .
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          New-Item -ItemType Directory -Force target\x86_64-pc-windows-gnu\release, dist | Out-Null
+          Copy-Item target\release\duckpond.exe target\x86_64-pc-windows-gnu\release\duckpond.exe
+          & "C:\Program Files (x86)\NSIS\makensis.exe" installer\windows\duckpond.nsi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckpond-windows
+          path: |
+            duckpond-selftest.txt
+            duckpond-selftest.png
+            dist/DuckPondSetup.exe
